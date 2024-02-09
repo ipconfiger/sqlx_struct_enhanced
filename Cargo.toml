@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    ".",
+    "sqlx_struct_macros"
+]
+
+[package]
+name = "sqlx_struct_enhanced"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+runtime-actix-native-tls = ["sqlx/runtime-actix-native-tls"]
+runtime-async-std-native-tls = ["sqlx/runtime-async-std-native-tls"]
+runtime-tokio-native-tls = ["sqlx/runtime-tokio-native-tls"]
+runtime-actix-rustls = ["sqlx/runtime-actix-rustls"]
+runtime-async-std-rustls = ["sqlx/runtime-async-std-rustls"]
+runtime-tokio-rustls = ["sqlx/runtime-tokio-rustls"]
+postgres = ["sqlx_struct_macros/postgres"]
+mysql = ["sqlx_struct_macros/mysql"]
+sqlite = ["sqlx_struct_macros/sqlite"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+sqlx = { version = "0.6.0", features = ["all"] }
+sqlx_struct_macros =  { path = "sqlx_struct_macros"}
+
+[dev-dependencies]
+sqlx = { version = "0.6", features = ["runtime-tokio-native-tls", "postgres"] }
+sqlx_struct_enhanced =  { path = ".", features = [ "runtime-tokio-native-tls", "postgres"] }
+tokio-test = "0"
