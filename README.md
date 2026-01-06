@@ -17,6 +17,8 @@ Auto-generate CRUD SQL operations for SQLx with type-safe query building.
 
 ## Quick Start
 
+> **📖 For comprehensive documentation and API reference, see [USAGE.md](USAGE.md)**
+
 ### Installation
 
 ```toml
@@ -364,6 +366,7 @@ transaction(&pool, |parent_tx| async move {
 
 ## Documentation
 
+- **[USAGE.md](USAGE.md)** - Complete usage guide and API reference (⭐ Start here)
 - [TESTING.md](TESTING.md) - Testing guide and CI/CD setup
 - [PHASE3_FEATURES.md](PHASE3_FEATURES.md) - New Phase 3 features (custom table names)
 - [CLAUDE.md](CLAUDE.md) - Development guidelines

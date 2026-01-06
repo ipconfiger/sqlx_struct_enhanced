@@ -86,3 +86,19 @@ cargo check
 
 - `src/traits.rs:35,47` - `count_query()` for MySQL and SQLite return `QueryAs` with `Postgres` type instead of their respective database types (copy-paste error)
 - `src/lib.rs` - `Scheme` struct and `Cache` are marked `#[allow(dead_code)]` but are actually used by the macro-generated code
+
+## Usage Documentation
+
+**For detailed usage instructions and API reference, see [USAGE.md](USAGE.md).**
+
+The USAGE.md file contains:
+- Quick start guide
+- Complete API reference for all CRUD methods
+- Bulk operations documentation
+- Advanced features (custom table names, transactions)
+- Common patterns and best practices
+- Testing guidelines
+- Troubleshooting guide
+- Migration examples from raw SQLx
+
+When working on projects that integrate this crate, refer to USAGE.md for comprehensive usage examples and patterns.
