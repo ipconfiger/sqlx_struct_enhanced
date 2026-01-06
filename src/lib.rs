@@ -495,6 +495,49 @@ impl Scheme {
         })
     }
 
+    /// Generates a bulk SELECT query for multiple IDs using WHERE IN clause with ORDER BY to preserve input order.
+    ///
+    /// Returns a cached `&'static str` for efficient reuse.
+    ///
+    /// The generated SQL uses ORDER BY CASE WHEN to ensure results are returned in the same order
+    /// as the input IDs, which is critical for >N query optimization.
+    ///
+    /// # Example
+    ///
+    /// For count=3 with PostgreSQL, generates:
+    /// ```sql
+    /// SELECT * FROM users WHERE id IN ($1,$2,$3) ORDER BY CASE id
+    ///     WHEN $1 THEN 0
+    ///     WHEN $2 THEN 1
+    ///     WHEN $3 THEN 2
+    /// END
+    /// ```
+    pub fn gen_bulk_select_sql_static(&self, count: usize) -> &'static str {
+        let key = format!("{}-bulk-select-{}", self.table_name, count);
+        get_or_insert_sql(key, || {
+            if count == 0 {
+                // Empty list: return a query that always returns empty result
+                format!(r#"SELECT * FROM {} WHERE 1=0"#, self.table_name)
+            } else {
+                let params: Vec<String> = (1..=count).map(|i| param_trans(format!("${}", i))).collect();
+                let in_clause = params.join(",");
+
+                // Generate ORDER BY CASE WHEN clause to preserve input order
+                let case_whens: Vec<String> = (1..=count).map(|i| {
+                    let param = param_trans(format!("${}", i));
+                    format!("WHEN {} THEN {}", param, i - 1)
+                }).collect();
+
+                let order_by = format!("ORDER BY CASE {}\n    {}\nEND", self.id_field, case_whens.join("\n    "));
+
+                format!(
+                    r#"SELECT * FROM {} WHERE {} IN ({}) {}"#,
+                    self.table_name, self.id_field, in_clause, order_by
+                )
+            }
+        })
+    }
+
     /// Generates a SELECT query to fetch a row by ID.
     ///
     /// Returns a cached `&'static str` for efficient reuse.
@@ -1196,6 +1239,173 @@ mod tests {
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM app.users WHERE id IN (?,?)");
+    }
+
+    #[test]
+    fn test_bulk_select_single_id() {
+        let scheme = Scheme {
+            table_name: "users".to_string(),
+            insert_fields: vec!["id".to_string(), "name".to_string()],
+            update_fields: vec!["name".to_string()],
+            id_field: "id".to_string(),
+        };
+
+        let sql = scheme.gen_bulk_select_sql_static(1);
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT * FROM users WHERE id IN ($1) ORDER BY CASE id\n    WHEN $1 THEN 0\nEND");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT * FROM users WHERE id IN (?) ORDER BY CASE id\n    WHEN ? THEN 0\nEND");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "SELECT * FROM users WHERE id IN (?) ORDER BY CASE id\n    WHEN ? THEN 0\nEND");
+    }
+
+    #[test]
+    fn test_bulk_select_multiple_ids() {
+        let scheme = Scheme {
+            table_name: "products".to_string(),
+            insert_fields: vec!["id".to_string(), "name".to_string()],
+            update_fields: vec!["name".to_string()],
+            id_field: "id".to_string(),
+        };
+
+        let sql = scheme.gen_bulk_select_sql_static(3);
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT * FROM products WHERE id IN ($1,$2,$3) ORDER BY CASE id\n    WHEN $1 THEN 0\n    WHEN $2 THEN 1\n    WHEN $3 THEN 2\nEND");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT * FROM products WHERE id IN (?,?,?) ORDER BY CASE id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\n    WHEN ? THEN 2\nEND");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "SELECT * FROM products WHERE id IN (?,?,?) ORDER BY CASE id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\n    WHEN ? THEN 2\nEND");
+    }
+
+    #[test]
+    fn test_bulk_select_empty_list() {
+        let scheme = Scheme {
+            table_name: "users".to_string(),
+            insert_fields: vec!["id".to_string(), "name".to_string()],
+            update_fields: vec!["name".to_string()],
+            id_field: "id".to_string(),
+        };
+
+        let sql = scheme.gen_bulk_select_sql_static(0);
+        assert_eq!(sql, "SELECT * FROM users WHERE 1=0");
+    }
+
+    #[test]
+    fn test_bulk_select_large_batch() {
+        let scheme = Scheme {
+            table_name: "logs".to_string(),
+            insert_fields: vec!["id".to_string()],
+            update_fields: vec![],
+            id_field: "id".to_string(),
+        };
+
+        let sql = scheme.gen_bulk_select_sql_static(100);
+
+        #[cfg(feature = "postgres")]
+        {
+            let in_params = (1..=100).map(|i| format!("${}", i)).collect::<Vec<_>>().join(",");
+            let order_by_params = (1..=100).map(|i| format!("WHEN ${} THEN {}", i, i - 1)).collect::<Vec<_>>().join("\n    ");
+            let expected = format!("SELECT * FROM logs WHERE id IN ({}) ORDER BY CASE id\n    {}\nEND", in_params, order_by_params);
+            assert_eq!(sql, expected);
+        }
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        {
+            let in_params = (1..=100).map(|_| "?").collect::<Vec<_>>().join(",");
+            let order_by_params = (0..100).map(|i| format!("WHEN ? THEN {}", i)).collect::<Vec<_>>().join("\n    ");
+            let expected = format!("SELECT * FROM logs WHERE id IN ({}) ORDER BY CASE id\n    {}\nEND", in_params, order_by_params);
+            assert_eq!(sql, expected);
+        }
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        {
+            let in_params = (1..=100).map(|_| "?").collect::<Vec<_>>().join(",");
+            let order_by_params = (0..100).map(|i| format!("WHEN ? THEN {}", i)).collect::<Vec<_>>().join("\n    ");
+            let expected = format!("SELECT * FROM logs WHERE id IN ({}) ORDER BY CASE id\n    {}\nEND", in_params, order_by_params);
+            assert_eq!(sql, expected);
+        }
+    }
+
+    #[test]
+    fn test_bulk_select_caching() {
+        let scheme = Scheme {
+            table_name: "items".to_string(),
+            insert_fields: vec!["id".to_string()],
+            update_fields: vec![],
+            id_field: "id".to_string(),
+        };
+
+        let sql1 = scheme.gen_bulk_select_sql_static(5);
+        let sql2 = scheme.gen_bulk_select_sql_static(5);
+
+        // Should be cached and return the same pointer
+        assert_eq!(sql1, sql2);
+        assert!(std::ptr::eq(sql1, sql2), "SQL should be cached");
+    }
+
+    #[test]
+    fn test_bulk_select_different_counts_cached_separately() {
+        let scheme = Scheme {
+            table_name: "items".to_string(),
+            insert_fields: vec!["id".to_string()],
+            update_fields: vec![],
+            id_field: "id".to_string(),
+        };
+
+        let sql1 = scheme.gen_bulk_select_sql_static(3);
+        let sql2 = scheme.gen_bulk_select_sql_static(5);
+
+        // Different counts should generate different SQL
+        assert_ne!(sql1, sql2);
+        assert!(!std::ptr::eq(sql1, sql2), "Different counts should have different cached SQL");
+    }
+
+    #[test]
+    fn test_bulk_select_custom_id_field() {
+        let scheme = Scheme {
+            table_name: "orders".to_string(),
+            insert_fields: vec!["order_id".to_string(), "customer_id".to_string()],
+            update_fields: vec!["customer_id".to_string()],
+            id_field: "order_id".to_string(),
+        };
+
+        let sql = scheme.gen_bulk_select_sql_static(2);
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN ($1,$2) ORDER BY CASE order_id\n    WHEN $1 THEN 0\n    WHEN $2 THEN 1\nEND");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN (?,?) ORDER BY CASE order_id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\nEND");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN (?,?) ORDER BY CASE order_id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\nEND");
+    }
+
+    #[test]
+    fn test_bulk_select_with_custom_table_name() {
+        let scheme = Scheme {
+            table_name: "app.users".to_string(),
+            insert_fields: vec!["id".to_string()],
+            update_fields: vec![],
+            id_field: "id".to_string(),
+        };
+
+        let sql = scheme.gen_bulk_select_sql_static(2);
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN ($1,$2) ORDER BY CASE id\n    WHEN $1 THEN 0\n    WHEN $2 THEN 1\nEND");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN (?,?) ORDER BY CASE id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\nEND");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN (?,?) ORDER BY CASE id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\nEND");
     }
 
     #[test]

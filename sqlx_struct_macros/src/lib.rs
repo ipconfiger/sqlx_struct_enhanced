@@ -126,6 +126,20 @@ fn postgres_impl(
                 let query = sqlx::query::<Postgres>(sql);
                 #gen_fill_bulk_update
             }
+            fn bulk_select(ids: &[String]) -> QueryAs<'_, Postgres, Self, <Postgres as HasArguments<'_>>::Arguments> where Self: Sized {
+                #gen_scheme_code
+                let sql = scheme.gen_bulk_select_sql_static(ids.len());
+                let mut query = sqlx::query_as::<Postgres, Self>(sql);
+                // Bind IN clause parameters
+                for id in ids {
+                    query = query.bind(id.as_str());
+                }
+                // Bind ORDER BY CASE WHEN parameters (same IDs again)
+                for id in ids {
+                    query = query.bind(id.as_str());
+                }
+                query
+            }
         }
     }
 }
@@ -220,6 +234,20 @@ fn mysql_impl(
                 let query = sqlx::query::<MySql>(sql);
                 #gen_fill_bulk_update
             }
+            fn bulk_select(ids: &[String]) -> QueryAs<'_, MySql, Self, <MySql as HasArguments<'_>>::Arguments> where Self: Sized {
+                #gen_scheme_code
+                let sql = scheme.gen_bulk_select_sql_static(ids.len());
+                let mut query = sqlx::query_as::<MySql, Self>(sql);
+                // Bind IN clause parameters
+                for id in ids {
+                    query = query.bind(id.as_str());
+                }
+                // Bind ORDER BY CASE WHEN parameters (same IDs again)
+                for id in ids {
+                    query = query.bind(id.as_str());
+                }
+                query
+            }
         }
     }
 }
@@ -313,6 +341,20 @@ fn sqlite_impl(
                 let sql = scheme.gen_bulk_update_sql_static(items.len());
                 let query = sqlx::query::<Sqlite>(sql);
                 #gen_fill_bulk_update
+            }
+            fn bulk_select(ids: &[String]) -> QueryAs<'_, Sqlite, Self, <Sqlite as HasArguments<'_>>::Arguments> where Self: Sized {
+                #gen_scheme_code
+                let sql = scheme.gen_bulk_select_sql_static(ids.len());
+                let mut query = sqlx::query_as::<Sqlite, Self>(sql);
+                // Bind IN clause parameters
+                for id in ids {
+                    query = query.bind(id.as_str());
+                }
+                // Bind ORDER BY CASE WHEN parameters (same IDs again)
+                for id in ids {
+                    query = query.bind(id.as_str());
+                }
+                query
             }
         }
     }
