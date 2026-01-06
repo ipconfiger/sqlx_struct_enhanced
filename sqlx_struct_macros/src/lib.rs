@@ -130,11 +130,6 @@ fn postgres_impl(
                 #gen_scheme_code
                 let sql = scheme.gen_bulk_select_sql_static(ids.len());
                 let mut query = sqlx::query_as::<Postgres, Self>(sql);
-                // Bind IN clause parameters
-                for id in ids {
-                    query = query.bind(id.as_str());
-                }
-                // Bind ORDER BY CASE WHEN parameters (same IDs again)
                 for id in ids {
                     query = query.bind(id.as_str());
                 }
@@ -238,11 +233,6 @@ fn mysql_impl(
                 #gen_scheme_code
                 let sql = scheme.gen_bulk_select_sql_static(ids.len());
                 let mut query = sqlx::query_as::<MySql, Self>(sql);
-                // Bind IN clause parameters
-                for id in ids {
-                    query = query.bind(id.as_str());
-                }
-                // Bind ORDER BY CASE WHEN parameters (same IDs again)
                 for id in ids {
                     query = query.bind(id.as_str());
                 }
@@ -346,11 +336,6 @@ fn sqlite_impl(
                 #gen_scheme_code
                 let sql = scheme.gen_bulk_select_sql_static(ids.len());
                 let mut query = sqlx::query_as::<Sqlite, Self>(sql);
-                // Bind IN clause parameters
-                for id in ids {
-                    query = query.bind(id.as_str());
-                }
-                // Bind ORDER BY CASE WHEN parameters (same IDs again)
                 for id in ids {
                     query = query.bind(id.as_str());
                 }

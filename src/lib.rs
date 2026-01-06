@@ -344,7 +344,7 @@ impl Scheme {
     ///
     /// Returns a cached `&'static str` for efficient reuse.
     pub fn gen_count_sql_static(&self, where_stmt: &str) -> &'static str {
-        let key = format!("{}-count", self.table_name);
+        let key = format!("{}-count-{}", self.table_name, where_stmt);
         get_or_insert_sql(key, || {
             format!("SELECT COUNT(*) FROM {} WHERE {}", self.table_name, where_stmt)
         })
@@ -409,7 +409,7 @@ impl Scheme {
                     format!("WHEN {} THEN {}", id_param, val_param)
                 }).collect();
 
-                let case_expr = format!("{}=CASE {} END", field, when_clauses.join(" "));
+                let case_expr = format!("{}=CASE {} {} END", field, self.id_field, when_clauses.join(" "));
                 set_clauses.push(case_expr);
             }
 
@@ -495,22 +495,23 @@ impl Scheme {
         })
     }
 
-    /// Generates a bulk SELECT query for multiple IDs using WHERE IN clause with ORDER BY to preserve input order.
+    /// Generates a bulk SELECT query for multiple IDs using WHERE IN clause.
     ///
     /// Returns a cached `&'static str` for efficient reuse.
     ///
-    /// The generated SQL uses ORDER BY CASE WHEN to ensure results are returned in the same order
-    /// as the input IDs, which is critical for >N query optimization.
+    /// Note: This version does not guarantee the order of results. If you need results
+    /// in the same order as input IDs, you should sort them in your application code.
     ///
     /// # Example
     ///
     /// For count=3 with PostgreSQL, generates:
     /// ```sql
-    /// SELECT * FROM users WHERE id IN ($1,$2,$3) ORDER BY CASE id
-    ///     WHEN $1 THEN 0
-    ///     WHEN $2 THEN 1
-    ///     WHEN $3 THEN 2
-    /// END
+    /// SELECT * FROM users WHERE id IN ($1,$2,$3)
+    /// ```
+    ///
+    /// For MySQL/SQLite, generates:
+    /// ```sql
+    /// SELECT * FROM users WHERE id IN (?,?,?)
     /// ```
     pub fn gen_bulk_select_sql_static(&self, count: usize) -> &'static str {
         let key = format!("{}-bulk-select-{}", self.table_name, count);
@@ -521,18 +522,9 @@ impl Scheme {
             } else {
                 let params: Vec<String> = (1..=count).map(|i| param_trans(format!("${}", i))).collect();
                 let in_clause = params.join(",");
-
-                // Generate ORDER BY CASE WHEN clause to preserve input order
-                let case_whens: Vec<String> = (1..=count).map(|i| {
-                    let param = param_trans(format!("${}", i));
-                    format!("WHEN {} THEN {}", param, i - 1)
-                }).collect();
-
-                let order_by = format!("ORDER BY CASE {}\n    {}\nEND", self.id_field, case_whens.join("\n    "));
-
                 format!(
-                    r#"SELECT * FROM {} WHERE {} IN ({}) {}"#,
-                    self.table_name, self.id_field, in_clause, order_by
+                    r#"SELECT * FROM {} WHERE {} IN ({})"#,
+                    self.table_name, self.id_field, in_clause
                 )
             }
         })
@@ -1253,13 +1245,13 @@ mod tests {
         let sql = scheme.gen_bulk_select_sql_static(1);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM users WHERE id IN ($1) ORDER BY CASE id\n    WHEN $1 THEN 0\nEND");
+        assert_eq!(sql, "SELECT * FROM users WHERE id IN ($1)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "SELECT * FROM users WHERE id IN (?) ORDER BY CASE id\n    WHEN ? THEN 0\nEND");
+        assert_eq!(sql, "SELECT * FROM users WHERE id IN (?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
-        assert_eq!(sql, "SELECT * FROM users WHERE id IN (?) ORDER BY CASE id\n    WHEN ? THEN 0\nEND");
+        assert_eq!(sql, "SELECT * FROM users WHERE id IN (?)");
     }
 
     #[test]
@@ -1274,13 +1266,13 @@ mod tests {
         let sql = scheme.gen_bulk_select_sql_static(3);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM products WHERE id IN ($1,$2,$3) ORDER BY CASE id\n    WHEN $1 THEN 0\n    WHEN $2 THEN 1\n    WHEN $3 THEN 2\nEND");
+        assert_eq!(sql, "SELECT * FROM products WHERE id IN ($1,$2,$3)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "SELECT * FROM products WHERE id IN (?,?,?) ORDER BY CASE id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\n    WHEN ? THEN 2\nEND");
+        assert_eq!(sql, "SELECT * FROM products WHERE id IN (?,?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
-        assert_eq!(sql, "SELECT * FROM products WHERE id IN (?,?,?) ORDER BY CASE id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\n    WHEN ? THEN 2\nEND");
+        assert_eq!(sql, "SELECT * FROM products WHERE id IN (?,?,?)");
     }
 
     #[test]
@@ -1310,8 +1302,7 @@ mod tests {
         #[cfg(feature = "postgres")]
         {
             let in_params = (1..=100).map(|i| format!("${}", i)).collect::<Vec<_>>().join(",");
-            let order_by_params = (1..=100).map(|i| format!("WHEN ${} THEN {}", i, i - 1)).collect::<Vec<_>>().join("\n    ");
-            let expected = format!("SELECT * FROM logs WHERE id IN ({}) ORDER BY CASE id\n    {}\nEND", in_params, order_by_params);
+            let expected = format!("SELECT * FROM logs WHERE id IN ({})", in_params);
             assert_eq!(sql, expected);
         }
 
@@ -1378,13 +1369,13 @@ mod tests {
         let sql = scheme.gen_bulk_select_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN ($1,$2) ORDER BY CASE order_id\n    WHEN $1 THEN 0\n    WHEN $2 THEN 1\nEND");
+        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN ($1,$2)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN (?,?) ORDER BY CASE order_id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\nEND");
+        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
-        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN (?,?) ORDER BY CASE order_id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\nEND");
+        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN (?,?)");
     }
 
     #[test]
@@ -1399,13 +1390,13 @@ mod tests {
         let sql = scheme.gen_bulk_select_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN ($1,$2) ORDER BY CASE id\n    WHEN $1 THEN 0\n    WHEN $2 THEN 1\nEND");
+        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN ($1,$2)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN (?,?) ORDER BY CASE id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\nEND");
+        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
-        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN (?,?) ORDER BY CASE id\n    WHEN ? THEN 0\n    WHEN ? THEN 1\nEND");
+        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN (?,?)");
     }
 
     #[test]
@@ -1592,10 +1583,10 @@ mod tests {
         let sql = scheme.gen_bulk_update_sql_static(1);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE users SET name=CASE WHEN $1 THEN $2 END,email=CASE WHEN $3 THEN $4 END WHERE id IN ($5)");
+        assert_eq!(sql, "UPDATE users SET name=CASE id WHEN $1 THEN $2 END,email=CASE id WHEN $3 THEN $4 END WHERE id IN ($5)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE users SET name=CASE WHEN ? THEN ? END,email=CASE WHEN ? THEN ? END WHERE id IN (?)");
+        assert_eq!(sql, "UPDATE users SET name=CASE id WHEN ? THEN ? END,email=CASE id WHEN ? THEN ? END WHERE id IN (?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE users SET name=CASE WHEN ? THEN ? END,email=CASE WHEN ? THEN ? END WHERE id IN (?)");
@@ -1613,10 +1604,10 @@ mod tests {
         let sql = scheme.gen_bulk_update_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE products SET name=CASE WHEN $1 THEN $2 WHEN $3 THEN $4 END,price=CASE WHEN $5 THEN $6 WHEN $7 THEN $8 END WHERE id IN ($9,$10)");
+        assert_eq!(sql, "UPDATE products SET name=CASE id WHEN $1 THEN $2 WHEN $3 THEN $4 END,price=CASE id WHEN $5 THEN $6 WHEN $7 THEN $8 END WHERE id IN ($9,$10)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE products SET name=CASE WHEN ? THEN ? WHEN ? THEN ? END,price=CASE WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
+        assert_eq!(sql, "UPDATE products SET name=CASE id WHEN ? THEN ? WHEN ? THEN ? END,price=CASE id WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE products SET name=CASE WHEN ? THEN ? WHEN ? THEN ? END,price=CASE WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
@@ -1634,10 +1625,10 @@ mod tests {
         let sql = scheme.gen_bulk_update_sql_static(3);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE categories SET name=CASE WHEN $1 THEN $2 WHEN $3 THEN $4 WHEN $5 THEN $6 END WHERE id IN ($7,$8,$9)");
+        assert_eq!(sql, "UPDATE categories SET name=CASE id WHEN $1 THEN $2 WHEN $3 THEN $4 WHEN $5 THEN $6 END WHERE id IN ($7,$8,$9)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE categories SET name=CASE WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?,?)");
+        assert_eq!(sql, "UPDATE categories SET name=CASE id WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE categories SET name=CASE WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?,?)");
@@ -1746,10 +1737,10 @@ mod tests {
         let sql = scheme.gen_bulk_update_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE app.users SET username=CASE WHEN $1 THEN $2 WHEN $3 THEN $4 END WHERE id IN ($5,$6)");
+        assert_eq!(sql, "UPDATE app.users SET username=CASE id WHEN $1 THEN $2 WHEN $3 THEN $4 END WHERE id IN ($5,$6)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE app.users SET username=CASE WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
+        assert_eq!(sql, "UPDATE app.users SET username=CASE id WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE app.users SET username=CASE WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
