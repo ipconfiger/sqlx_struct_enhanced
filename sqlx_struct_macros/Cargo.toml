@@ -9,6 +9,7 @@ edition = "2021"
 proc-macro = true
 
 [features]
+# No default feature - must be explicitly selected via parent crate
 postgres = []
 mysql = []
 sqlite = []
