@@ -31,7 +31,14 @@ This is a Cargo workspace with two members:
    - Database-specific parameter syntax: `$1, $2` (Postgres) vs `?` (MySQL/SQLite)
    - Field wrapping: `"field"` (Postgres) vs `` `field` `` (MySQL) vs `field` (SQLite)
 
-4. **Usage Pattern**:
+4. **Compile-Time Index Analysis** (`sqlx_struct_macros/src/`):
+   - **`analyze_queries`** attribute macro for automatic index recommendations
+   - **`simple_parser.rs`**: Simplified SQL parser for extracting WHERE and ORDER BY columns
+   - **`query_extractor.rs`**: Extracts query patterns and struct fields from code
+   - **`compile_time_analyzer.rs`**: Main analysis logic that prints recommendations
+   - Zero runtime overhead - all analysis happens at compile time
+
+5. **Usage Pattern**:
    ```rust
    #[derive(EnhancedCrud)]
    struct MyTable { id: String, name: String, value: i32 }
@@ -41,6 +48,20 @@ This is a Cargo workspace with two members:
    // - by_pk(), make_query(), where_query(), count_query() - static methods
    // - Table name: "my_table" (auto-converted to snake_case)
    // - ID field: First field (id)
+
+   // Index analysis:
+   #[sqlx_struct_macros::analyze_queries]
+   mod my_queries {
+       #[derive(EnhancedCrud)]
+       struct User { id: String, email: String }
+
+       impl User {
+           fn find_by_email(email: &str) {
+               let _ = User::where_query!("email = $1");
+               // During compilation, macro will recommend: CREATE INDEX idx_user_email ON User (email)
+           }
+       }
+   }
    ```
 
 ## Development Commands
@@ -74,6 +95,12 @@ cargo test test_something_async
 cargo check
 ```
 
+### Run compile-time index analysis example
+```bash
+cargo build --example compile_time_analysis
+# View index recommendations in build output
+```
+
 ## Important Implementation Details
 
 - **First field is primary key**: The macro assumes the first struct field is the ID/primary key
@@ -89,15 +116,22 @@ cargo check
 
 ## Usage Documentation
 
-**For detailed usage instructions and API reference, see [USAGE.md](USAGE.md).**
+**For detailed usage instructions and API reference, see:**
 
-The USAGE.md file contains:
-- Quick start guide
-- Complete API reference for all CRUD methods
-- Bulk operations documentation
-- Advanced features (custom table names, transactions)
-- Common patterns and best practices
-- Testing guidelines
+- **[USAGE.md](USAGE.md)** - Complete usage guide and API reference
+  - Quick start guide
+  - Complete API reference for all CRUD methods
+  - Bulk operations documentation
+  - Advanced features (custom table names, transactions)
+  - Common patterns and best practices
+  - Testing guidelines
+
+- **[COMPILE_TIME_INDEX_ANALYSIS.md](COMPILE_TIME_INDEX_ANALYSIS.md)** - Compile-time index analysis guide 🆕
+  - How `#[analyze_queries]` macro works
+  - Index recommendation rules
+  - Best practices for using index analysis
+  - Integration with existing code
+  - Limitations and future enhancements
 - Troubleshooting guide
 - Migration examples from raw SQLx
 

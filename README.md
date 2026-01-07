@@ -12,6 +12,7 @@ Auto-generate CRUD SQL operations for SQLx with type-safe query building.
 - ✅ **Compile-time SQL Generation**: No runtime overhead
 - ✅ **Global SQL Caching**: Efficient query reuse
 - ✅ **Custom Table Names**: Override default table names
+- ✅ **Index Analysis** 🆕: Compile-time query analysis with automatic index recommendations
 - ✅ **Type-Safe**: Full type safety with Rust's type system
 - ✅ **Zero-Copy**: No unnecessary allocations for cached queries
 
@@ -364,9 +365,89 @@ transaction(&pool, |parent_tx| async move {
 - Complex multi-step processes with partial rollback capability
 - Error isolation in nested business logic
 
+### Compile-Time Index Analysis
+
+The `#[analyze_queries]` attribute macro automatically analyzes your queries at compile time and recommends indexes to optimize performance:
+
+```rust
+#[sqlx_struct_macros::analyze_queries]
+mod user_queries {
+    #[derive(EnhancedCrud)]
+    struct User {
+        id: String,
+        email: String,
+        status: String,
+        created_at: i64,
+    }
+
+    impl User {
+        fn find_by_email(email: &str) {
+            // Query: WHERE email = $1
+            let _ = User::where_query!("email = $1");
+        }
+
+        fn find_active_users_since(timestamp: i64) {
+            // Query: WHERE status = $1 AND created_at > $2 ORDER BY created_at DESC
+            let _ = User::where_query!("status = $1 AND created_at > $2 ORDER BY created_at DESC");
+        }
+    }
+}
+```
+
+When you compile this code, the macro outputs index recommendations:
+
+```
+🔍 ======================================================
+🔍   SQLx Struct - Index Recommendations
+🔍 ======================================================
+
+📊 Table: User
+
+   ✨ Recommended: idx_user_email
+      Columns: email
+      Reason: Single column: WHERE email = $1
+      SQL:    CREATE INDEX idx_user_email ON User (email)
+
+   ✨ Recommended: idx_user_status_created_at
+      Columns: status, created_at
+      Reason: WHERE status ORDER BY created_at
+      SQL:    CREATE INDEX idx_user_status_created_at ON User (status, created_at)
+
+🔍 ======================================================
+🔍   End of Recommendations
+🔍 ======================================================
+```
+
+**How It Works:**
+1. **Parses struct definitions** to extract field names
+2. **Scans for query patterns** like `where_query!()` and `make_query!()`
+3. **Analyzes SQL WHERE clauses** to find conditions:
+   - Equality: `col = $1`
+   - Range: `col > $1`, `col < $1`, `col >= $1`, `col <= $1`
+   - IN clauses: `col IN ($1, $2)`
+   - LIKE clauses: `col LIKE $1`
+4. **Analyzes ORDER BY clauses** to find sorting columns
+5. **Generates recommendations** with optimal priority ordering:
+   - Equality > IN > Range > LIKE > ORDER BY
+6. **Deduplicates indexes** across multiple queries
+
+**Benefits:**
+- ✅ **Zero Runtime Overhead**: All analysis happens at compile time
+- ✅ **Automatic Optimization**: No manual query analysis needed
+- ✅ **Performance Guidance**: Get index recommendations as you write code
+- ✅ **Smart Priority Ordering**: Optimizes column order based on condition types
+- ✅ **Deduplication**: Identifies which indexes serve multiple queries
+- ✅ **SQL Ready**: Copy-paste the generated CREATE INDEX statements
+
+**Try It:**
+```bash
+cargo build --example compile_time_analysis
+```
+
 ## Documentation
 
 - **[USAGE.md](USAGE.md)** - Complete usage guide and API reference (⭐ Start here)
+- **[COMPILE_TIME_INDEX_ANALYSIS.md](COMPILE_TIME_INDEX_ANALYSIS.md)** - Compile-time index analysis guide (🆕)
 - [TESTING.md](TESTING.md) - Testing guide and CI/CD setup
 - [PHASE3_FEATURES.md](PHASE3_FEATURES.md) - New Phase 3 features (custom table names)
 - [CLAUDE.md](CLAUDE.md) - Development guidelines
@@ -418,6 +499,60 @@ See the `tests/` directory for complete examples:
 - Phase 3: Batch insert (`bulk_insert`)
 - Phase 3: Batch update (`bulk_update`)
 - Phase 3: Transaction support (`transaction` helper)
+- Phase 0: Compile-time index analysis (`analyze_queries` macro) 🆕
+  - ✅ Day 1: Basic equality and ORDER BY analysis
+  - ✅ Day 2: Enhanced pattern recognition (Range, IN, LIKE operators)
+    - Support for `>`, `<`, `>=`, `<=` operators
+    - Support for `IN` clauses
+    - Support for `LIKE` clauses
+    - Smart priority ordering (Equality > IN > Range > LIKE > ORDER BY)
+    - 18 comprehensive unit tests, all passing
+    - Enhanced documentation and examples
+  - ✅ Day 3: Negation conditions and extended features
+    - Support for `!=`, `<>` inequality operators
+    - Support for `NOT LIKE` clauses
+    - `make_query!()` pattern recognition
+    - Extended priority: Equality > IN > Range > LIKE > Inequality > NOT LIKE > ORDER BY
+    - 26 comprehensive unit tests, all passing
+    - Enhanced documentation with new rules
+  - ✅ Day 4: OR conditions and query complexity detection 🆕
+    - OR conditions detection (`has_or_conditions()`)
+    - Parentheses grouping detection (`has_parentheses()`)
+    - Subquery detection (`has_subquery()`)
+    - Query complexity analysis API (`analyze_query_complexity()`)
+    - 39 comprehensive unit tests, all passing
+    - Documentation for OR condition indexing strategies
+  - ✅ Day 5: Advanced analysis and recommendations 🆕
+    - Unique index detection for `id` columns
+    - Partial index detection (soft deletes, status filters)
+    - Covering indexes with INCLUDE columns
+    - Index size estimation (byte-level estimates)
+    - OR condition separate index recommendations
+    - 18 comprehensive unit tests, all passing (total: 57 tests)
+    - Enhanced documentation with Rules 12-15
+  - ✅ Day 6: Advanced multi-column optimization and database-specific features
+    - Functional/expression index detection (LOWER, DATE, UPPER, etc.)
+    - Index type selection (B-tree, Hash, BRIN, GIN/GiST recommendations)
+    - Index effectiveness scoring (0-110 scale with detailed factors)
+    - Database-specific optimization hints (PostgreSQL BRIN, trigram, GIN)
+    - Real-world query pattern testing (pagination, search, time-series)
+    - 20 comprehensive unit tests, all passing (total: 77 tests)
+    - Enhanced documentation with Rules 16-19
+  - ✅ Day 7: Index intersection strategies and performance prediction
+    - Column cardinality analysis (Very High, High, Medium, Low, Very Low)
+    - Column order optimization (cardinality-based within condition types)
+    - Index intersection vs composite index recommendations
+    - Query performance gain prediction (20-99% estimates)
+    - Alternative index strategies for complex scenarios
+    - 16 comprehensive unit tests, all passing (total: 93 tests)
+    - Enhanced documentation with Rules 20-23
+  - ✅ Day 8: Query plan visualization and cost analysis 🆕
+    - Query execution plan hints (JOIN, ORDER BY, GROUP BY analysis)
+    - Visual ASCII art representation of index structure and execution path
+    - Query cost estimation (Very Low to High, compared to full table scan)
+    - Performance characteristics and optimization recommendations
+    - 18 comprehensive unit tests, all passing (total: 110 tests)
+    - Enhanced documentation with Rules 24-26
 
 ### Planned 🚧
 - Savepoint support for nested transactions

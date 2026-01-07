@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(cargo clean:*)",
+      "Bash(cargo test:*)",
+      "Bash(ls:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(psql:*)",
+      "Bash(cargo run:*)",
+      "Bash(export:*)",
+      "Bash(git checkout:*)",
+      "Bash(perl:*)",
+      "Bash(cat:*)",
+      "Bash(timeout 30 cargo test:*)",
+      "Bash(grep:*)",
+      "Bash(for file in DECIMAL_FEATURE_SUMMARY.md DECIMAL_QUICK_START.md DECIMAL_USAGE_GUIDE.md)",
+      "Bash(do:*)",
+      "Bash(done:*)",
+      "Bash(timeout:*)",
+      "Bash(cargo expand:*)",
+      "Bash(echo:*)",
+      "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" timeout 30 cargo test:*)",
+      "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" timeout 60 cargo test:*)",
+      "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" cargo test:*)",
+      "Bash(cargo install:*)",
+      "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" timeout:*)",
+      "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" timeout 120 cargo test:*)",
+      "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" timeout 120 cargo clean:*)"
+    ]
+  }
+}
