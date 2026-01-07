@@ -296,6 +296,28 @@ fn prepare_where(w: &str, field_count: i32) -> String {
 
     where_sql
 }
+/// Column definition with optional type casting for SQL queries.
+///
+/// This struct stores metadata about a column including whether it needs
+/// explicit type casting in SELECT statements.
+///
+/// # Example
+///
+/// For a field `#[sqlx(cast_as = "TEXT")] pub price: Option<String>`:
+/// ```ignore
+/// ColumnDefinition {
+///     name: "price".to_string(),
+///     cast_as: Some("TEXT".to_string()),
+/// }
+/// ```
+/// This will generate: `price::TEXT as price` in SELECT queries.
+#[derive(Debug, Clone)]
+pub struct ColumnDefinition {
+    /// Column name
+    pub name: String,
+    /// Optional type cast (e.g., "TEXT" for NUMERIC→TEXT conversion)
+    pub cast_as: Option<String>,
+}
 
 
 /// SQL generation scheme for CRUD operations.
@@ -309,11 +331,13 @@ fn prepare_where(w: &str, field_count: i32) -> String {
 /// * `insert_fields` - Fields to include in INSERT statements
 /// * `update_fields` - Fields to include in UPDATE statements (excludes ID)
 /// * `id_field` - Name of the primary key/ID field
+/// * `column_definitions` - Column metadata with optional type casting
 pub struct Scheme {
     pub table_name: String,
     pub insert_fields: Vec<String>,
     pub update_fields: Vec<String>,
-    pub id_field: String
+    pub id_field: String,
+    pub column_definitions: Vec<ColumnDefinition>,
 }
 
 // Global SQL cache that stores strings and returns &'static str references
@@ -340,13 +364,56 @@ fn get_or_insert_sql(key: String, gen_fn: impl FnOnce() -> String) -> &'static s
 }
 
 impl Scheme {
+    /// Generates a SELECT clause with explicit column list and optional type casting.
+    ///
+    /// This method replaces `SELECT *` with an explicit column list, applying
+    /// type casting where specified by `#[sqlx(cast_as = "TYPE")]` attributes.
+    ///
+    /// # Example
+    ///
+    /// For column_definitions:
+    /// - ColumnDefinition { name: "id", cast_as: None }
+    /// - ColumnDefinition { name: "commission_rate", cast_as: Some("TEXT") }
+    ///
+    /// Generates: `"id, commission_rate::TEXT as commission_rate"`
+    ///
+    /// # Returns
+    ///
+    /// A cached `&'static str` containing the comma-separated column list with
+    /// optional casting expressions.
+    pub fn gen_select_columns_static(&self) -> &'static str {
+        let key = format!("{}-select-columns", self.table_name);
+        get_or_insert_sql(key, || {
+            // If no column definitions provided, fall back to SELECT *
+            if self.column_definitions.is_empty() {
+                return "*".to_string();
+            }
+
+            // Generate explicit column list with optional casting
+            self.column_definitions.iter()
+                .map(|col| {
+                    match &col.cast_as {
+                        Some(cast_type) => {
+                            // PostgreSQL: column::TYPE as column
+                            // Example: commission_rate::TEXT as commission_rate
+                            format!("{}::{} as {}", col.name, cast_type, col.name)
+                        }
+                        None => col.name.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    }
+
     /// Generates a COUNT query with the given WHERE clause.
     ///
     /// Returns a cached `&'static str` for efficient reuse.
     pub fn gen_count_sql_static(&self, where_stmt: &str) -> &'static str {
         let key = format!("{}-count-{}", self.table_name, where_stmt);
         get_or_insert_sql(key, || {
-            format!("SELECT COUNT(*) FROM {} WHERE {}", self.table_name, where_stmt)
+            let where_sql = prepare_where(where_stmt, 1);
+            format!("SELECT COUNT(*) FROM {} WHERE {}", self.table_name, where_sql)
         })
     }
 
@@ -380,7 +447,7 @@ impl Scheme {
                 let row_params: Vec<String> = (0..field_count).map(|_| {
                     let p = format!("${}", param_index);
                     param_index += 1;
-                    p
+                    param_trans(p)
                 }).collect();
                 all_params.push(format!("({})", row_params.join(",")));
             }
@@ -514,17 +581,20 @@ impl Scheme {
     /// SELECT * FROM users WHERE id IN (?,?,?)
     /// ```
     pub fn gen_bulk_select_sql_static(&self, count: usize) -> &'static str {
+        // IMPORTANT: Call gen_select_columns_static() BEFORE acquiring the lock
+        // to avoid deadlock since it also accesses SQL_CACHE
+        let columns = self.gen_select_columns_static();
         let key = format!("{}-bulk-select-{}", self.table_name, count);
         get_or_insert_sql(key, || {
             if count == 0 {
                 // Empty list: return a query that always returns empty result
-                format!(r#"SELECT * FROM {} WHERE 1=0"#, self.table_name)
+                format!(r#"SELECT {} FROM {} WHERE 1=0"#, columns, self.table_name)
             } else {
                 let params: Vec<String> = (1..=count).map(|i| param_trans(format!("${}", i))).collect();
                 let in_clause = params.join(",");
                 format!(
-                    r#"SELECT * FROM {} WHERE {} IN ({})"#,
-                    self.table_name, self.id_field, in_clause
+                    r#"SELECT {} FROM {} WHERE {} IN ({})"#,
+                    columns, self.table_name, self.id_field, in_clause
                 )
             }
         })
@@ -534,10 +604,13 @@ impl Scheme {
     ///
     /// Returns a cached `&'static str` for efficient reuse.
     pub fn gen_select_by_id_sql_static(&self) -> &'static str {
+        // IMPORTANT: Call gen_select_columns_static() BEFORE acquiring the lock
+        // to avoid deadlock since it also accesses SQL_CACHE
+        let columns = self.gen_select_columns_static();
         let key = format!("{}-select-by-id", self.table_name);
         get_or_insert_sql(key, || {
             let id_param = param_trans("$1".to_string());
-            format!(r#"SELECT * FROM {} WHERE {}={}"#, self.table_name, self.id_field, id_param)
+            format!(r#"SELECT {} FROM {} WHERE {}={}"#, columns, self.table_name, self.id_field, id_param)
         })
     }
 
@@ -545,10 +618,13 @@ impl Scheme {
     ///
     /// Returns a cached `&'static str` for efficient reuse.
     pub fn gen_select_where_sql_static(&self, where_stmt: &str) -> &'static str {
+        // IMPORTANT: Call gen_select_columns_static() BEFORE acquiring the lock
+        // to avoid deadlock since it also accesses SQL_CACHE
+        let columns = self.gen_select_columns_static();
         let key = format!("{}-select-where-{}", self.table_name, where_stmt);
         get_or_insert_sql(key, || {
             let where_sql = prepare_where(where_stmt, 1);
-            format!(r#"SELECT * FROM {} WHERE {}"#, self.table_name, where_sql)
+            format!(r#"SELECT {} FROM {} WHERE {}"#, columns, self.table_name, where_sql)
         })
     }
 
@@ -587,6 +663,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string(), "email".to_string()],
             update_fields: vec!["name".to_string(), "email".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_insert_sql_static();
@@ -608,6 +685,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string(), "email".to_string()],
             update_fields: vec!["name".to_string(), "email".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_update_by_id_sql_static();
@@ -629,6 +707,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string()],
             update_fields: vec!["name".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_delete_sql_static();
@@ -650,6 +729,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string()],
             update_fields: vec!["name".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_select_by_id_sql_static();
@@ -665,16 +745,37 @@ mod tests {
     }
 
     #[test]
+    fn test_select_with_cast_as() {
+        // Test the new cast_as functionality for DECIMAL support
+        let scheme = Scheme {
+            table_name: "decimal_users".to_string(),  // Use unique table name to avoid cache collision
+            insert_fields: vec!["id".to_string(), "commission_rate".to_string()],
+            update_fields: vec!["commission_rate".to_string()],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None },
+                ColumnDefinition { name: "commission_rate".to_string(), cast_as: Some("TEXT".to_string()) },
+            ],
+        };
+
+        let sql = scheme.gen_select_by_id_sql_static();
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT id, commission_rate::TEXT as commission_rate FROM decimal_users WHERE id=$1");
+    }
+
+    #[test]
     fn test_scheme_count_sql_generation() {
         let scheme = Scheme {
-            table_name: "users".to_string(),
+            table_name: "orders".to_string(),  // Use different table name to avoid cache collision
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_count_sql_static("active = true");
-        assert_eq!(sql, "SELECT COUNT(*) FROM users WHERE active = true");
+        assert_eq!(sql, "SELECT COUNT(*) FROM orders WHERE active = true");
     }
 
     #[test]
@@ -684,6 +785,7 @@ mod tests {
             insert_fields: vec![],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.pre_sql_static("SELECT * FROM [Self] WHERE active = true");
@@ -697,6 +799,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         // First call should cache the SQL
@@ -733,6 +836,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_select_where_sql_static("1=1");
@@ -746,6 +850,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string(), "price".to_string()],
             update_fields: vec!["name".to_string(), "price".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_update_where_sql_static("category = {}");
@@ -767,6 +872,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_delete_where_sql_static("created_at < NOW()");
@@ -788,6 +894,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let scheme2 = Scheme {
@@ -795,6 +902,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme1.gen_insert_sql_static();
@@ -812,6 +920,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_insert_sql_static();
@@ -837,6 +946,7 @@ mod tests {
             insert_fields,
             update_fields,
             id_field: "field0".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_insert_sql_static();
@@ -855,6 +965,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_insert_sql_static();
@@ -868,6 +979,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_select_where_sql_static(
@@ -888,6 +1000,7 @@ mod tests {
             insert_fields: vec![],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.pre_sql_static(
@@ -906,6 +1019,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_count_sql_static(
@@ -924,6 +1038,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_delete_where_sql_static(
@@ -941,6 +1056,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "value".to_string()],
             update_fields: vec!["value".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_update_where_sql_static("key = 'app_version'");
@@ -960,6 +1076,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_insert_sql_static();
@@ -978,6 +1095,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_select_by_id_sql_static();
@@ -997,6 +1115,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_delete_where_sql_static("level = 'DEBUG'");
@@ -1018,6 +1137,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_delete_where_sql_static("expires_at < {}");
@@ -1039,6 +1159,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_delete_where_sql_static(
@@ -1057,6 +1178,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_delete_where_sql_static("status = {} AND created_at < {}");
@@ -1075,6 +1197,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme.gen_delete_where_sql_static("expired = true");
@@ -1092,6 +1215,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string()],
             update_fields: vec!["name".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_delete_sql_static(1);
@@ -1113,6 +1237,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string()],
             update_fields: vec!["name".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_delete_sql_static(3);
@@ -1134,6 +1259,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_delete_sql_static(100);
@@ -1164,6 +1290,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme.gen_bulk_delete_sql_static(5);
@@ -1181,6 +1308,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme.gen_bulk_delete_sql_static(3);
@@ -1198,6 +1326,7 @@ mod tests {
             insert_fields: vec!["order_id".to_string(), "customer_id".to_string()],
             update_fields: vec!["customer_id".to_string()],
             id_field: "order_id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_delete_sql_static(2);
@@ -1219,6 +1348,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_delete_sql_static(2);
@@ -1240,6 +1370,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string()],
             update_fields: vec!["name".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_select_sql_static(1);
@@ -1261,6 +1392,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string()],
             update_fields: vec!["name".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_select_sql_static(3);
@@ -1282,6 +1414,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string()],
             update_fields: vec!["name".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_select_sql_static(0);
@@ -1295,6 +1428,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_select_sql_static(100);
@@ -1330,6 +1464,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme.gen_bulk_select_sql_static(5);
@@ -1347,6 +1482,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme.gen_bulk_select_sql_static(3);
@@ -1364,6 +1500,7 @@ mod tests {
             insert_fields: vec!["order_id".to_string(), "customer_id".to_string()],
             update_fields: vec!["customer_id".to_string()],
             id_field: "order_id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_select_sql_static(2);
@@ -1385,6 +1522,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_select_sql_static(2);
@@ -1406,6 +1544,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string(), "email".to_string()],
             update_fields: vec!["name".to_string(), "email".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_insert_sql_static(1);
@@ -1427,6 +1566,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string(), "price".to_string()],
             update_fields: vec!["name".to_string(), "price".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_insert_sql_static(3);
@@ -1448,6 +1588,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string()],
             update_fields: vec!["name".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_insert_sql_static(4);
@@ -1469,6 +1610,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "message".to_string(), "level".to_string()],
             update_fields: vec!["message".to_string(), "level".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_insert_sql_static(50);
@@ -1502,6 +1644,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "value".to_string()],
             update_fields: vec!["value".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme.gen_bulk_insert_sql_static(5);
@@ -1519,6 +1662,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme.gen_bulk_insert_sql_static(3);
@@ -1536,6 +1680,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_insert_sql_static(5);
@@ -1557,6 +1702,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "username".to_string()],
             update_fields: vec!["username".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_insert_sql_static(2);
@@ -1578,6 +1724,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string(), "email".to_string()],
             update_fields: vec!["name".to_string(), "email".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_update_sql_static(1);
@@ -1599,6 +1746,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string(), "price".to_string()],
             update_fields: vec!["name".to_string(), "price".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_update_sql_static(2);
@@ -1620,6 +1768,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "name".to_string()],
             update_fields: vec!["name".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_update_sql_static(3);
@@ -1641,6 +1790,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "message".to_string(), "level".to_string()],
             update_fields: vec!["message".to_string(), "level".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_update_sql_static(10);
@@ -1676,6 +1826,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "value".to_string()],
             update_fields: vec!["value".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme.gen_bulk_update_sql_static(5);
@@ -1693,6 +1844,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql1 = scheme.gen_bulk_update_sql_static(3);
@@ -1710,6 +1862,7 @@ mod tests {
             insert_fields: vec!["id".to_string()],
             update_fields: vec![],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_update_sql_static(2);
@@ -1732,6 +1885,7 @@ mod tests {
             insert_fields: vec!["id".to_string(), "username".to_string()],
             update_fields: vec!["username".to_string()],
             id_field: "id".to_string(),
+            column_definitions: vec![],
         };
 
         let sql = scheme.gen_bulk_update_sql_static(2);

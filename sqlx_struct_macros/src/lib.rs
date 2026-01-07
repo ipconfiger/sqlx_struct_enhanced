@@ -1,10 +1,16 @@
+// 编译期索引分析模块
+mod compile_time_analyzer;
+mod query_extractor;
+mod simple_parser;
+mod struct_schema_parser;
+
 use proc_macro::TokenStream;
 use proc_macro2::{TokenStream as TokenStream2};
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, Ident};
+use syn::{parse_macro_input, DeriveInput, Ident, Expr};
 
 // Single derive macro that uses conditional compilation internally
-#[proc_macro_derive(EnhancedCrud, attributes(table_name))]
+#[proc_macro_derive(EnhancedCrud, attributes(table_name, crud))]
 pub fn enhanced_crud_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let sql_builder = SqlBuilder::new(Schema::new(&input));
@@ -367,10 +373,18 @@ fn to_snake_case(s: &str) -> String {
     result
 }
 
+/// Column metadata for code generation with optional type casting
+#[derive(Debug, Clone)]
+struct ColumnDefinition {
+    name: String,
+    cast_as: Option<String>,
+}
+
 struct Schema {
     table_name: String,
     fields: Vec<Ident>,
-    id_field: Ident
+    id_field: Ident,
+    column_definitions: Vec<ColumnDefinition>,
 }
 
 impl Schema {
@@ -406,10 +420,43 @@ impl Schema {
         }).collect();
         let id_field = fields_name.first().expect("Struct must have at least one field").clone();
 
+        // Parse column definitions with cast_as
+        let column_definitions = fields.iter()
+            .map(|field| {
+                let name = field.ident.as_ref().unwrap().to_string();
+                let mut cast_as = None;
+
+                // Parse #[crud(cast_as = "TYPE")]
+                for attr in &field.attrs {
+                    let path_str = quote::quote!(#attr).to_string();
+                    // Parse #[crud(...)] attributes
+                    if path_str.contains("crud") {
+                        let tokens = attr.tokens.to_string();
+                        if let Some(cast_pos) = tokens.find("cast_as") {
+                            let remaining = &tokens[cast_pos..];
+                            if let Some(eq_pos) = remaining.find('=') {
+                                let value_str = &remaining[eq_pos + 1..];
+                                let end_pos = value_str.find(',').unwrap_or(value_str.len());
+                                let value = value_str[..end_pos]
+                                    .trim()
+                                    .trim_matches(|c| c == '"' || c == '\'' || c == ')' || c == ' ');
+                                if !value.is_empty() {
+                                    cast_as = Some(value.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ColumnDefinition { name, cast_as }
+            })
+            .collect();
+
         Self {
             table_name,
             fields: fields_name,
-            id_field
+            id_field,
+            column_definitions,
         }
     }
 }
@@ -436,12 +483,38 @@ impl SqlBuilder {
                 stringify!(#f).to_string()
             }
         });
+
+        // Generate column definitions with optional casting
+        let column_definitions = self.scheme.column_definitions.iter().map(|col| {
+            let name = &col.name;
+            let cast_as = &col.cast_as;
+            match cast_as {
+                Some(cast_type) => {
+                    quote! {
+                        ::sqlx_struct_enhanced::ColumnDefinition {
+                            name: #name.to_string(),
+                            cast_as: Some(#cast_type.to_string()),
+                        }
+                    }
+                }
+                None => {
+                    quote! {
+                        ::sqlx_struct_enhanced::ColumnDefinition {
+                            name: #name.to_string(),
+                            cast_as: None,
+                        }
+                    }
+                }
+            }
+        });
+
         quote!{
             let scheme: Scheme = Scheme {
                 table_name: #table_name.to_string(),
                 insert_fields: vec![#(#append_insert_stmt),*],
                 update_fields: vec![#(#append_update_stmt),*],
-                id_field: stringify!(#id_field).to_string()
+                id_field: stringify!(#id_field).to_string(),
+                column_definitions: vec![#(#column_definitions),*],
             };
         }
     }
@@ -504,3 +577,66 @@ impl SqlBuilder {
         }
     }
 }
+
+// 编译期查询分析属性宏
+#[proc_macro_attribute]
+pub fn analyze_queries(attr: TokenStream, input: TokenStream) -> TokenStream {
+    compile_time_analyzer::analyze_queries(attr, input)
+}
+
+// ============================================================================
+// Migration Macros
+// ============================================================================
+
+/// Generate a simple migration with manual SQL
+///
+/// # Syntax
+///
+/// ```ignore
+/// let migration = sqlx_struct_macros::migration!("create_users",
+///     "CREATE TABLE users (id VARCHAR(36) PRIMARY KEY);",
+///     "DROP TABLE users;"
+/// );
+/// ```
+#[proc_macro]
+pub fn migration(input: TokenStream) -> TokenStream {
+    use syn::{token::Comma, Expr};
+    use syn::parse::{Parse, ParseStream};
+
+    // Parse three comma-separated expressions
+    struct MigrationInput {
+        name: Expr,
+        up_sql: Expr,
+        down_sql: Expr,
+    }
+
+    impl Parse for MigrationInput {
+        fn parse(input: ParseStream) -> syn::Result<Self> {
+            let name = input.parse::<Expr>()?;
+            input.parse::<Comma>()?;
+            let up_sql = input.parse::<Expr>()?;
+            input.parse::<Comma>()?;
+            let down_sql = input.parse::<Expr>()?;
+
+            Ok(MigrationInput { name, up_sql, down_sql })
+        }
+    }
+
+    let MigrationInput { name, up_sql, down_sql } = parse_macro_input!(input as MigrationInput);
+
+    let expanded = quote::quote! {
+        {
+            use sqlx_struct_enhanced::migration::Migration;
+
+            let mut migration = Migration::new(#name.to_string(), "manual".to_string());
+            migration.up_sql = vec![#up_sql.to_string()];
+            migration.down_sql = vec![#down_sql.to_string()];
+            migration.checksum = "".to_string();
+
+            migration
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
