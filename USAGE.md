@@ -175,6 +175,74 @@ User::bulk_update(&users).execute(&pool).await?;
 
 ## Advanced Features
 
+### DECIMAL/NUMERIC Support
+
+The crate supports PostgreSQL DECIMAL/NUMERIC columns with automatic type casting for Rust String types:
+
+```rust
+#[derive(EnhancedCrud)]
+#[table_name = "products"]
+struct Product {
+    id: String,
+    name: String,
+
+    // Define decimal precision for migration generation
+    #[crud(decimal(precision = 10, scale = 2))]
+    #[crud(cast_as = "TEXT")]
+    price: Option<String>,
+
+    #[crud(decimal(precision = 5, scale = 2))]
+    #[crud(cast_as = "TEXT")]
+    discount: Option<String>,
+
+    quantity: i32,
+}
+```
+
+**How it works:**
+- `#[crud(decimal(precision = N, scale = M))]` - Defines NUMERIC(N,M) for migration generation
+- `#[crud(cast_as = "TEXT")]` - Adds type casting in SELECT queries: `price::TEXT as price`
+- Generated SELECT: `SELECT id, name, price::TEXT as price, discount::TEXT as discount, quantity FROM products`
+
+**Use cases:**
+- Financial data where exact decimal precision is required
+- Storing decimal values as String in Rust to avoid floating-point errors
+- Automatic type conversion between database NUMERIC and Rust String
+
+**Example:**
+```rust
+// Insert
+let mut product = Product {
+    id: "1".to_string(),
+    name: "Laptop".to_string(),
+    price: Some("1299.99".to_string()),
+    discount: Some("15.00".to_string()),
+    quantity: 10,
+};
+product.insert_bind().execute(&pool).await?;
+
+// Select - automatically casts NUMERIC to TEXT
+let product = Product::by_pk().bind("1").fetch_one(&pool).await?;
+assert_eq!(product.price, Some("1299.99".to_string()));
+```
+
+**Multiple Attributes:**
+You can use multiple `#[crud(...)]` attributes on a single field:
+
+```rust
+#[derive(EnhancedCrud)]
+struct OrderItem {
+    id: String,
+
+    // Multiple attributes for same field
+    #[crud(decimal(precision = 12, scale = 4))]
+    #[crud(cast_as = "TEXT")]
+    unit_price: Option<String>,
+
+    quantity: i32,
+}
+```
+
 ### Custom Table Names
 
 Override the auto-generated table name using `#[table_name]` attribute:

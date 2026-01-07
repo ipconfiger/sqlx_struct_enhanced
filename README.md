@@ -9,6 +9,7 @@ Auto-generate CRUD SQL operations for SQLx with type-safe query building.
 - ✅ **Transaction Support**: Atomic multi-operation transactions with automatic rollback
 - ✅ **Conditional Operations**: WHERE queries, count queries, and conditional deletes
 - ✅ **Multiple Database Backends**: PostgreSQL, MySQL, SQLite
+- ✅ **DECIMAL/NUMERIC Support** 🆕: Type-safe decimal handling with automatic casting
 - ✅ **Compile-time SQL Generation**: No runtime overhead
 - ✅ **Global SQL Caching**: Efficient query reuse
 - ✅ **Custom Table Names**: Override default table names
@@ -85,6 +86,55 @@ let users = User::where_query("email LIKE '%@example.com'")
 let (count,) = User::count_query("active = true")
     .fetch_one(&pool).await?;
 ```
+
+## DECIMAL/NUMERIC Support
+
+For financial data or other use cases requiring exact decimal precision:
+
+```rust
+#[derive(EnhancedCrud)]
+#[table_name = "products"]
+struct Product {
+    id: String,
+    name: String,
+
+    #[crud(decimal(precision = 10, scale = 2))]
+    #[crud(cast_as = "TEXT")]
+    price: Option<String>,
+
+    #[crud(decimal(precision = 5, scale = 2))]
+    #[crud(cast_as = "TEXT")]
+    discount: Option<String>,
+
+    quantity: i32,
+}
+
+// Insert product with decimal prices
+let mut product = Product {
+    id: "1".to_string(),
+    name: "Laptop".to_string(),
+    price: Some("1299.99".to_string()),
+    discount: Some("15.00".to_string()),
+    quantity: 10,
+};
+product.insert_bind().execute(&pool).await?;
+
+// Select - automatically casts NUMERIC to TEXT
+let product = Product::by_pk().bind("1").fetch_one(&pool).await?;
+println!("Price: {}", product.price.unwrap()); // "1299.99"
+```
+
+**How it works:**
+- `#[crud(decimal(precision = N, scale = M))]` - For migration generation (NUMERIC columns)
+- `#[crud(cast_as = "TEXT")]` - Adds type casting in SELECT queries
+- Generated SQL: `SELECT id, name, price::TEXT as price, ... FROM products`
+
+**Benefits:**
+- ✅ Exact decimal precision (no floating-point errors)
+- ✅ Type-safe String storage in Rust
+- ✅ Automatic type casting in queries
+
+> **📖 For full DECIMAL documentation, see [DECIMAL_USAGE_GUIDE.md](DECIMAL_USAGE_GUIDE.md)**
 
 ## Table Naming
 
@@ -447,9 +497,10 @@ cargo build --example compile_time_analysis
 ## Documentation
 
 - **[USAGE.md](USAGE.md)** - Complete usage guide and API reference (⭐ Start here)
+- **[DECIMAL_USAGE_GUIDE.md](DECIMAL_USAGE_GUIDE.md)** - DECIMAL/NUMERIC support guide (🆕)
+- **[DECIMAL_QUICK_START.md](DECIMAL_QUICK_START.md)** - DECIMAL quick start examples (🆕)
+- **[DECIMAL_FEATURE_SUMMARY.md](DECIMAL_FEATURE_SUMMARY.md)** - DECIMAL feature overview (🆕)
 - **[COMPILE_TIME_INDEX_ANALYSIS.md](COMPILE_TIME_INDEX_ANALYSIS.md)** - Compile-time index analysis guide (🆕)
-- [TESTING.md](TESTING.md) - Testing guide and CI/CD setup
-- [PHASE3_FEATURES.md](PHASE3_FEATURES.md) - New Phase 3 features (custom table names)
 - [CLAUDE.md](CLAUDE.md) - Development guidelines
 
 ## Architecture
@@ -492,13 +543,19 @@ See the `tests/` directory for complete examples:
 ### Completed ✅
 - Phase 1: P0 fixes (memory leaks, cache, feature flags)
 - Phase 1: High priority issues (redundant code, typos, docs)
-- Phase 2: Testing and optimization (52 unit tests)
+- Phase 2: Testing and optimization (62 unit tests)
 - Phase 3: Custom table names
 - Phase 3: Conditional delete (`delete_where_query`)
 - Phase 3: Batch delete (`bulk_delete`)
 - Phase 3: Batch insert (`bulk_insert`)
 - Phase 3: Batch update (`bulk_update`)
 - Phase 3: Transaction support (`transaction` helper)
+- **DECIMAL/NUMERIC Support** 🆕
+  - Type-safe decimal handling with automatic casting
+  - `#[crud(decimal(precision = N, scale = M))]` attribute for migration generation
+  - `#[crud(cast_as = "TYPE")]` attribute for query-time type casting
+  - Full integration test coverage
+  - Bug fixes: SQL cache deadlock, attribute parsing, placeholder replacement
 - Phase 0: Compile-time index analysis (`analyze_queries` macro) 🆕
   - ✅ Day 1: Basic equality and ORDER BY analysis
   - ✅ Day 2: Enhanced pattern recognition (Range, IN, LIKE operators)
