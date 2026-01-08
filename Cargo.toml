@@ -11,10 +11,14 @@ edition = "2021"
 
 [features]
 default = ["postgres"]
-postgres = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/postgres", "sqlx_struct_macros/postgres"]
-mysql = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/mysql", "sqlx_struct_macros/mysql"]
-sqlite = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/sqlite", "sqlx_struct_macros/sqlite"]
+postgres = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/postgres", "sqlx_struct_macros/postgres", "uuid"]
+mysql = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/mysql", "sqlx_struct_macros/mysql", "uuid"]
+sqlite = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/sqlite", "sqlx_struct_macros/sqlite", "uuid"]
 decimal = ["rust_decimal"]
+chrono = ["dep:chrono"]
+json = ["dep:serde_json"]
+uuid = ["dep:uuid"]
+all-types = ["decimal", "chrono", "json", "uuid"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -22,7 +26,9 @@ decimal = ["rust_decimal"]
 sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio", "tls-rustls", "all-databases", "uuid", "chrono"], optional = true}
 sqlx_struct_macros = { version = "*", path = "sqlx_struct_macros", default-features = false }
 tokio = {version = "1.26.0", features = ["full"]}
-uuid = { version = "1.10.0", features = ["v4", "fast-rng"] }
+uuid = { version = "1.10.0", features = ["v4", "fast-rng"], optional = true }
+chrono = { version = "0.4", optional = true }
+serde_json = { version = "1.0", optional = true }
 once_cell = "1.19"
 futures = "0.3"
 rust_decimal = { version = "1.32", optional = true }

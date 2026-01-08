@@ -68,12 +68,34 @@ where
     {
         let bind_value = value.into_bind_value();
         self = match bind_value {
+            // Existing variants
             BindValue::String(s) => self.bind(s),
             BindValue::I32(i) => self.bind(i),
             BindValue::I64(i) => self.bind(i),
             BindValue::F64(f) => self.bind(f),
             BindValue::Bool(b) => self.bind(b),
             BindValue::Decimal(s) => self.bind(s),
+
+            // Additional numeric types
+            BindValue::I8(i) => self.bind(i),
+            BindValue::I16(i) => self.bind(i),
+            BindValue::F32(f) => self.bind(f),
+
+            // Date/time types (all bind as String)
+            BindValue::NaiveDate(s) => self.bind(s),
+            BindValue::NaiveTime(s) => self.bind(s),
+            BindValue::NaiveDateTime(s) => self.bind(s),
+            BindValue::DateTimeUtc(s) => self.bind(s),
+
+            // JSON (bind as String)
+            BindValue::Json(s) => self.bind(s),
+
+            // Binary (bind as Vec<u8>)
+            BindValue::Binary(bytes) => self.bind(bytes),
+
+            // UUID (bind as String)
+            BindValue::Uuid(s) => self.bind(s),
+
             BindValue::_Marker(_) => panic!("BindValue::_Marker should never be used"),
         };
         self
@@ -107,6 +129,7 @@ where
     {
         let bind_value = value.into_bind_value();
         match bind_value {
+            // Existing variants
             BindValue::String(s) => {
                 self.inner = self.inner.bind(s);
                 self
@@ -131,6 +154,57 @@ where
                 self.inner = self.inner.bind(s);
                 self
             }
+
+            // Additional numeric types
+            BindValue::I8(i) => {
+                self.inner = self.inner.bind(i);
+                self
+            }
+            BindValue::I16(i) => {
+                self.inner = self.inner.bind(i);
+                self
+            }
+            BindValue::F32(f) => {
+                self.inner = self.inner.bind(f);
+                self
+            }
+
+            // Date/time types (all bind as String)
+            BindValue::NaiveDate(s) => {
+                self.inner = self.inner.bind(s);
+                self
+            }
+            BindValue::NaiveTime(s) => {
+                self.inner = self.inner.bind(s);
+                self
+            }
+            BindValue::NaiveDateTime(s) => {
+                self.inner = self.inner.bind(s);
+                self
+            }
+            BindValue::DateTimeUtc(s) => {
+                self.inner = self.inner.bind(s);
+                self
+            }
+
+            // JSON (bind as String)
+            BindValue::Json(s) => {
+                self.inner = self.inner.bind(s);
+                self
+            }
+
+            // Binary (bind as Vec<u8>)
+            BindValue::Binary(bytes) => {
+                self.inner = self.inner.bind(bytes);
+                self
+            }
+
+            // UUID (bind as String)
+            BindValue::Uuid(s) => {
+                self.inner = self.inner.bind(s);
+                self
+            }
+
             BindValue::_Marker(_) => {
                 panic!("BindValue::_Marker should never be used");
             }
