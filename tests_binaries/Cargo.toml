@@ -2,20 +2,36 @@
 # This creates a standalone workspace to avoid inheriting parent workspace features
 
 [package]
-name = "mysql_integration_test_binary"
+name = "integration_test_binaries"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
+# MySQL integration test binary
 [[bin]]
 name = "mysql_integration_test"
 path = "mysql_test.rs"
 
+# SQLite integration test binary
+[[bin]]
+name = "sqlite_integration_test"
+path = "sqlite_test.rs"
+
 [dependencies]
-# Explicitly enable mysql feature for sqlx
-sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio-rustls", "json", "mysql", "macros"] }
-sqlx_struct_enhanced = { path = "..", default-features = false, features = ["mysql", "all-types"] }
+# Note: We need to enable multiple database features for different binaries
+# sqlx_struct_enhanced will be built with appropriate features for each binary
+sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio-rustls", "json", "macros"] }
+sqlx_struct_enhanced = { path = "..", default-features = false }
 tokio = { version = "1.26.0", features = ["full"] }
 chrono = "0.4"
 serde_json = "1.0"
 uuid = { version = "1.10.0", features = ["v4", "fast-rng"] }
+
+# Feature flags for different databases
+[features]
+# MySQL integration tests
+mysql = ["sqlx/mysql", "sqlx_struct_enhanced/mysql", "sqlx_struct_enhanced/all-types"]
+# SQLite integration tests
+sqlite = ["sqlx/sqlite", "sqlx_struct_enhanced/sqlite", "sqlx_struct_enhanced/all-types"]
+# PostgreSQL integration tests (if needed)
+postgres = ["sqlx/postgres", "sqlx_struct_enhanced/postgres", "sqlx_struct_enhanced/all-types"]

@@ -14,6 +14,7 @@ When using sqlx's `#[derive(FromRow)]` macro in a workspace context with feature
 tests_binaries/
 ├── Cargo.toml                      # Standalone workspace configuration
 ├── mysql_test.rs                   # MySQL integration tests
+├── sqlite_test.rs                  # SQLite integration tests
 └── target/                         # Build artifacts
 ```
 
@@ -32,7 +33,7 @@ docker compose up -d mysql
 
 ```bash
 cd tests_binaries
-cargo run --bin mysql_integration_test
+cargo run --bin mysql_integration_test --features mysql
 ```
 
 ### Test Coverage
@@ -81,42 +82,87 @@ The MySQL integration test suite includes 7 test scenarios:
 ✅ Inserted record
 ✅ Numeric types test passed
 
-🔧 Starting test_mysql_extended_types_chrono_datetime...
-✅ Chrono date/time types test passed
-
-🔧 Starting test_mysql_extended_types_binary...
-✅ Binary types test passed
-
-🔧 Starting test_mysql_extended_types_uuid...
-✅ UUID types test passed
-
-🔧 Starting test_mysql_extended_types_json...
-✅ JSON types test passed
-
-🔧 Starting test_mysql_extended_types_complex_where...
-✅ Complex WHERE query test passed
-
-🔧 Starting test_mysql_extended_types_unsigned_where...
-✅ Unsigned integers WHERE clause test passed
+... (all 7 tests)
 
 ==========================================
 ✅ All MySQL integration tests passed!
 ==========================================
 ```
 
-## Database Configuration
+### Database Configuration
 
-The test program uses the following default MySQL connection:
+Default MySQL connection:
 
 ```rust
 mysql://root:test@127.0.0.1:3306/test_sqlx
 ```
 
-You can override this using the `MYSQL_DATABASE_URL` environment variable:
+Override with environment variable:
 
 ```bash
 export MYSQL_DATABASE_URL="mysql://user:pass@host:port/database"
-cargo run --bin mysql_integration_test
+cargo run --bin mysql_integration_test --features mysql
+```
+
+## SQLite Integration Tests
+
+### Prerequisites
+
+No prerequisites required! SQLite uses an in-memory database by default.
+
+### Running Tests
+
+```bash
+cd tests_binaries
+cargo run --bin sqlite_integration_test --features sqlite
+```
+
+### Test Coverage
+
+The SQLite integration test suite includes the same 7 test scenarios as MySQL:
+
+1. **Numeric Types** (`test_sqlite_extended_types_insert_select_numeric`)
+2. **Chrono Date/Time Types** (`test_sqlite_extended_types_chrono_datetime`)
+3. **Binary Types** (`test_sqlite_extended_types_binary`)
+4. **UUID Types** (`test_sqlite_extended_types_uuid`)
+5. **JSON Types** (`test_sqlite_extended_types_json`)
+6. **Complex WHERE Queries** (`test_sqlite_extended_types_complex_where`)
+7. **Unsigned Integers in WHERE** (`test_sqlite_extended_types_unsigned_where`)
+
+### Expected Output
+
+```
+🚀 SQLite Integration Tests - Binary Program
+==========================================
+
+🔧 Connecting to SQLite: sqlite::memory:
+✅ Connected to SQLite
+✅ Table 'extended_types_test' created
+
+🔧 Starting test_sqlite_extended_types_insert_select_numeric...
+✅ Inserted record
+✅ Numeric types test passed
+
+... (all 7 tests)
+
+==========================================
+✅ All SQLite integration tests passed!
+==========================================
+```
+
+### Database Configuration
+
+Default SQLite connection (in-memory):
+
+```rust
+sqlite::memory:
+```
+
+Use a file-based database:
+
+```bash
+export SQLITE_DATABASE_URL="sqlite:/path/to/database.db"
+cargo run --bin sqlite_integration_test --features sqlite
 ```
 
 ## Key Implementation Details
@@ -130,16 +176,15 @@ The binary crate has its own `[workspace]` section to avoid inheriting the paren
 # This creates a standalone workspace to avoid inheriting parent workspace features
 ```
 
-### 2. Explicit Feature Configuration
+### 2. Feature Flags
 
-All features are explicitly enabled in the binary's Cargo.toml:
+Each database has its own feature flag:
 
 ```toml
-[dependencies]
-sqlx = { version = "0.7.3", default-features = false,
-         features = ["runtime-tokio-rustls", "json", "mysql", "macros"] }
-sqlx_struct_enhanced = { path = "..", default-features = false,
-                         features = ["mysql", "all-types"] }
+[features]
+mysql = ["sqlx/mysql", "sqlx_struct_enhanced/mysql", "sqlx_struct_enhanced/all-types"]
+sqlite = ["sqlx/sqlite", "sqlx_struct_enhanced/sqlite", "sqlx_struct_enhanced/all-types"]
+postgres = ["sqlx/postgres", "sqlx_struct_enhanced/postgres", "sqlx_struct_enhanced/all-types"]
 ```
 
 ### 3. Data Cleanup
@@ -153,10 +198,18 @@ sqlx::query("DELETE FROM extended_types_test")
     .expect("Failed to clean up test data");
 ```
 
-### 4. MySQL-Specific Syntax
+### 4. Database-Specific Syntax
 
-Tests use MySQL's `?` placeholder syntax instead of PostgreSQL's `$1, $2`:
+**MySQL** uses `?` placeholders:
+```rust
+let results = ExtendedTypesTest::where_query_ext("tiny_int >= ? AND small_int > ?")
+    .bind_proxy(3i16)
+    .bind_proxy(1002i16)
+    .fetch_all(pool)
+    .await?;
+```
 
+**SQLite** also uses `?` placeholders (same as MySQL):
 ```rust
 let results = ExtendedTypesTest::where_query_ext("tiny_int >= ? AND small_int > ?")
     .bind_proxy(3i16)
@@ -167,7 +220,7 @@ let results = ExtendedTypesTest::where_query_ext("tiny_int >= ? AND small_int > 
 
 ## Troubleshooting
 
-### Connection Errors
+### MySQL Connection Errors
 
 If you see "Failed to connect to MySQL test database", ensure:
 
@@ -180,7 +233,7 @@ If you see "Failed to connect to MySQL test database", ensure:
 If you see trait bound errors like `FromRow<'r, MySqlRow> is not satisfied`:
 
 1. Ensure you're in the `tests_binaries` directory
-2. Ensure you're using the standalone binary, not workspace tests
+2. Ensure you're using the correct feature flag: `--features mysql` or `--features sqlite`
 3. Clean and rebuild: `cargo clean && cargo build`
 
 ### Test Failures
@@ -191,16 +244,14 @@ If tests fail with assertion errors:
 2. Verify table schema: look for "✅ Table 'extended_types_test' created"
 3. Run with `RUST_BACKTRACE=1` for detailed stack traces
 
-## Future Extensions
+## Test Results Summary
 
-This pattern can be extended for other database backends:
-
-```
-tests_binaries/
-├── mysql_test.rs       # ✅ Complete
-├── sqlite_test.rs      # TODO
-└── postgres_test.rs    # Optional (workspace tests already work)
-```
+| Database | Tests | Status |
+|----------|-------|--------|
+| PostgreSQL | 7/7 | ✅ Passing (workspace tests) |
+| MySQL | 7/7 | ✅ Passing (binary crate) |
+| SQLite | 7/7 | ✅ Passing (binary crate) |
+| **Total** | **21/21** | **✅ All Passing** |
 
 ## References
 

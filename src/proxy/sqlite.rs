@@ -117,7 +117,7 @@ where
 
 impl<'q, O> EnhancedQuery<'q, Sqlite, O> for EnhancedQueryAsSqlite<'q, O>
 where
-    O: Send + Unpin + for<'r> sqlx::FromRow<'r, SqliteRow> + sqlx::Decode<'q, Sqlite> + sqlx::Type<Sqlite>,
+    O: Send + Unpin + for<'r> sqlx::FromRow<'r, SqliteRow>,
 {
     fn from_query_as(inner: QueryAs<'q, Sqlite, O, <Sqlite as HasArguments<'q>>::Arguments>) -> Self {
         Self { inner }
