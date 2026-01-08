@@ -4,7 +4,7 @@
 // Each database (PostgreSQL, MySQL, SQLite) implements this trait for their
 // specific query types.
 
-use sqlx::{Database, Executor, Encode, Type};
+use sqlx::{Executor, Encode, Type};
 use std::future::Future;
 
 use crate::proxy::bind::BindProxy;

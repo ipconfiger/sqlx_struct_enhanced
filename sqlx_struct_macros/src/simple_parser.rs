@@ -3,6 +3,8 @@
 // 这个模块提供了基础的SQL解析功能，用于从查询字符串中提取
 // 需要索引的列名。这是一个简化的实现，不需要完整的SQL解析器。
 
+#![allow(dead_code)]
+
 use std::collections::HashSet;
 
 /// 列条件类型
@@ -1322,7 +1324,7 @@ impl SimpleSqlParser {
     /// Day 7: 生成替代策略
     ///
     /// 为当前推荐提供替代的索引策略
-    fn generate_alternative_strategies(&self, sql: &str, columns: &[String], complexity: &QueryComplexity) -> Vec<String> {
+    fn generate_alternative_strategies(&self, sql: &str, columns: &[String], _complexity: &QueryComplexity) -> Vec<String> {
         let mut alternatives = Vec::new();
 
         // 对于宽索引，建议索引交集

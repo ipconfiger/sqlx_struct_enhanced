@@ -2,6 +2,8 @@
 //
 // 这个模块使用正则表达式从代码字符串中提取 where_query!() 和 make_query!() 调用
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 
 /// 查询提取器

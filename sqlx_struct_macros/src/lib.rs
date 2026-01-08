@@ -4,17 +4,23 @@ mod query_extractor;
 mod simple_parser;
 mod struct_schema_parser;
 
+// DECIMAL 辅助方法生成模块
+mod decimal_helpers;
+
 use proc_macro::TokenStream;
 use proc_macro2::{TokenStream as TokenStream2};
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, Ident, Expr};
+use syn::{parse_macro_input, DeriveInput, Ident};
 
 // Single derive macro that uses conditional compilation internally
 #[proc_macro_derive(EnhancedCrud, attributes(table_name, crud))]
 pub fn enhanced_crud_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
+    let name = input.ident.clone();
+
+    // Generate EnhancedCrud implementation
     let sql_builder = SqlBuilder::new(Schema::new(&input));
-    let name = input.ident;
+    let table_name = sql_builder.scheme.table_name.clone();
     let gen_scheme_code = sql_builder.gen_scheme_code();
     let gen_fill_insert = sql_builder.fill_insert_param();
     let gen_fill_update = sql_builder.fill_update_param();
@@ -22,21 +28,36 @@ pub fn enhanced_crud_derive(input: TokenStream) -> TokenStream {
     let gen_fill_bulk_insert = sql_builder.fill_bulk_insert_param();
     let gen_fill_bulk_update = sql_builder.fill_bulk_update_param();
 
+    // Extract DECIMAL fields and generate helper methods
+    use decimal_helpers;
+    let decimal_fields = decimal_helpers::extract_decimal_fields(&input);
+    let decimal_helpers_impl = if !decimal_fields.is_empty() {
+        Some(decimal_helpers::generate_decimal_helpers_impl(&name, &decimal_fields))
+    } else {
+        None
+    };
+
     // Each database feature defines its own implementation function
     // Only the enabled feature's function will be compiled
 
     #[cfg(feature = "postgres")]
-    let output_token = postgres_impl(name, gen_scheme_code, gen_fill_insert, gen_fill_update, gen_fill_id, gen_fill_bulk_insert, gen_fill_bulk_update);
+    let enhanced_crud_impl = postgres_impl(name.clone(), table_name.clone(), gen_scheme_code, gen_fill_insert, gen_fill_update, gen_fill_id, gen_fill_bulk_insert, gen_fill_bulk_update);
 
     #[cfg(all(feature = "mysql", not(feature = "postgres"), not(feature = "sqlite")))]
-    let output_token = mysql_impl(name, gen_scheme_code, gen_fill_insert, gen_fill_update, gen_fill_id, gen_fill_bulk_insert, gen_fill_bulk_update);
+    let enhanced_crud_impl = mysql_impl(name.clone(), table_name.clone(), gen_scheme_code, gen_fill_insert, gen_fill_update, gen_fill_id, gen_fill_bulk_insert, gen_fill_bulk_update);
 
     #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
-    let output_token = sqlite_impl(name, gen_scheme_code, gen_fill_insert, gen_fill_update, gen_fill_id, gen_fill_bulk_insert, gen_fill_bulk_update);
+    let enhanced_crud_impl = sqlite_impl(name.clone(), table_name.clone(), gen_scheme_code, gen_fill_insert, gen_fill_update, gen_fill_id, gen_fill_bulk_insert, gen_fill_bulk_update);
 
     #[cfg(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")))]
-    let output_token = quote! {
+    let enhanced_crud_impl = quote! {
         compile_error!("You must enable one of the database features: postgres, mysql, or sqlite");
+    };
+
+    // Combine EnhancedCrud impl with DECIMAL helpers impl
+    let output_token = quote::quote! {
+        #enhanced_crud_impl
+        #decimal_helpers_impl
     };
 
     output_token.into()
@@ -45,6 +66,7 @@ pub fn enhanced_crud_derive(input: TokenStream) -> TokenStream {
 #[cfg(feature = "postgres")]
 fn postgres_impl(
     name: Ident,
+    table_name: String,
     gen_scheme_code: TokenStream2,
     gen_fill_insert: TokenStream2,
     gen_fill_update: TokenStream2,
@@ -141,6 +163,9 @@ fn postgres_impl(
                 }
                 query
             }
+            fn agg_query() -> ::sqlx_struct_enhanced::aggregate::AggQueryBuilder<'static, Postgres> where Self: Sized {
+                ::sqlx_struct_enhanced::aggregate::AggQueryBuilder::new(#table_name.to_string())
+            }
         }
     }
 }
@@ -148,6 +173,7 @@ fn postgres_impl(
 #[cfg(feature = "mysql")]
 fn mysql_impl(
     name: Ident,
+    table_name: String,
     gen_scheme_code: TokenStream2,
     gen_fill_insert: TokenStream2,
     gen_fill_update: TokenStream2,
@@ -244,6 +270,9 @@ fn mysql_impl(
                 }
                 query
             }
+            fn agg_query() -> ::sqlx_struct_enhanced::aggregate::AggQueryBuilder<'static, MySql> where Self: Sized {
+                ::sqlx_struct_enhanced::aggregate::AggQueryBuilder::new(#table_name.to_string())
+            }
         }
     }
 }
@@ -251,6 +280,7 @@ fn mysql_impl(
 #[cfg(feature = "sqlite")]
 fn sqlite_impl(
     name: Ident,
+    table_name: String,
     gen_scheme_code: TokenStream2,
     gen_fill_insert: TokenStream2,
     gen_fill_update: TokenStream2,
@@ -347,6 +377,9 @@ fn sqlite_impl(
                 }
                 query
             }
+            fn agg_query() -> ::sqlx_struct_enhanced::aggregate::AggQueryBuilder<'static, Sqlite> where Self: Sized {
+                ::sqlx_struct_enhanced::aggregate::AggQueryBuilder::new(#table_name.to_string())
+            }
         }
     }
 }
@@ -425,13 +458,46 @@ impl Schema {
             .map(|field| {
                 let name = field.ident.as_ref().unwrap().to_string();
                 let mut cast_as = None;
+                let mut is_decimal = false;
 
-                // Parse #[crud(cast_as = "TYPE")]
+                // Parse #[crud(...)] attributes
                 for attr in &field.attrs {
                     let path_str = quote::quote!(#attr).to_string();
-                    // Parse #[crud(...)] attributes
                     if path_str.contains("crud") {
                         let tokens = attr.tokens.to_string();
+
+                        // First: Check if this is a decimal field
+                        if tokens.contains("decimal") {
+                            is_decimal = true;
+
+                            // Extract cast_as from within decimal(...)
+                            if let Some(decimal_pos) = tokens.find("decimal") {
+                                let remaining = &tokens[decimal_pos..];
+                                if let Some(open_paren) = remaining.find('(') {
+                                    if let Some(close_paren) = remaining.find(')') {
+                                        let params_str = &remaining[open_paren + 1..close_paren];
+
+                                        // Parse cast_as parameter
+                                        if let Some(cast_pos) = params_str.find("cast_as") {
+                                            let cast_remaining = &params_str[cast_pos..];
+                                            if let Some(eq_pos) = cast_remaining.find('=') {
+                                                let value_str = &cast_remaining[eq_pos + 1..];
+                                                let end_pos = value_str.find(',').unwrap_or(value_str.len());
+                                                let value = value_str[..end_pos]
+                                                    .trim()
+                                                    .trim_matches('"')
+                                                    .trim_matches('\'');
+                                                if !value.is_empty() {
+                                                    cast_as = Some(value.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Second: Parse separate #[crud(cast_as = "TYPE")] (takes precedence)
                         if let Some(cast_pos) = tokens.find("cast_as") {
                             let remaining = &tokens[cast_pos..];
                             if let Some(eq_pos) = remaining.find('=') {
@@ -441,11 +507,16 @@ impl Schema {
                                     .trim()
                                     .trim_matches(|c| c == '"' || c == '\'' || c == ')' || c == ' ');
                                 if !value.is_empty() {
-                                    cast_as = Some(value.to_string());
+                                    cast_as = Some(value.to_string());  // Overrides decimal() cast_as
                                 }
                             }
                         }
                     }
+                }
+
+                // Apply default "TEXT" for decimal fields without cast_as
+                if is_decimal && cast_as.is_none() {
+                    cast_as = Some("TEXT".to_string());
                 }
 
                 ColumnDefinition { name, cast_as }

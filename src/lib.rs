@@ -1,7 +1,10 @@
 pub mod traits;
 pub mod proxy;
+pub mod decimal_helpers;
+pub mod aggregate;
 pub use sqlx_struct_macros::EnhancedCrud;
 pub use traits::{EnhancedCrud, EnhancedCrudExt};
+pub use aggregate::{AggQueryBuilder, Join, JoinType};
 
 #[cfg(feature = "postgres")]
 pub use proxy::{EnhancedQueryAsPostgres, EnhancedQuery, BindProxy, BindValue};
@@ -25,7 +28,7 @@ use sqlx::mysql::{MySqlPool, MySql};
 #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
 use sqlx::sqlite::{SqlitePool, Sqlite};
 
-use sqlx::{Database, Transaction, query::{Query, QueryAs}, Encode, Type, Decode};
+use sqlx::Transaction;
 use futures::Future;
 
 /// Transaction helper that executes a function within a database transaction.

@@ -34,6 +34,7 @@ futures = "0.3"
 rust_decimal = { version = "1.32", optional = true }
 
 [dev-dependencies]
-sqlx_struct_enhanced =  { version = "*", path = ".", default-features = false }
+sqlx_struct_enhanced =  { version = "*", path = ".", default-features = false, features = ["postgres"] }
+sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros"] }
 tokio-test = "0.4.2"
 serial_test = "3.0"

@@ -3,10 +3,11 @@
 //! This module provides functionality to parse Rust structs and extract
 //! database schema information including columns, types, and migration attributes.
 
-use proc_macro2::{TokenStream, Ident};
-use syn::{DeriveInput, Data, DataStruct, Fields, Type, PathSegment, PathArguments};
+#![allow(dead_code)]
+
+use proc_macro2::TokenStream;
+use syn::{DeriveInput, Data, Fields, Type, PathArguments};
 use quote::{quote, ToTokens};
-use std::collections::HashMap;
 
 /// Parsed schema information from a Rust struct
 #[derive(Debug, Clone)]
@@ -97,7 +98,7 @@ impl StructSchemaParser {
         input: &DeriveInput,
         default_table_name: &str,
     ) -> Result<(String, Option<String>), String> {
-        let mut table_name = default_table_name.to_string();
+        let table_name = default_table_name.to_string();
         let mut rename_from = None;
 
         // Parse #[migration(...)] attributes
@@ -128,7 +129,7 @@ impl StructSchemaParser {
     }
 
     /// Parse struct fields to extract column information
-    fn parse_fields(data: &Data, attrs: &[syn::Attribute]) -> Result<Vec<StructColumn>, String> {
+    fn parse_fields(data: &Data, _attrs: &[syn::Attribute]) -> Result<Vec<StructColumn>, String> {
         let struct_data = match data {
             Data::Struct(s) => s,
             _ => return Err("Can only derive migration on structs".to_string()),
@@ -216,23 +217,7 @@ impl StructSchemaParser {
             if path_str.contains("crud") {
                 let tokens = attr.tokens.to_string();
 
-                // Parse cast_as = "TYPE"
-                if let Some(cast_pos) = tokens.find("cast_as") {
-                    let remaining = &tokens[cast_pos..];
-                    if let Some(eq_pos) = remaining.find('=') {
-                        let value_str = &remaining[eq_pos + 1..];
-                        let end_pos = value_str.find(',').unwrap_or(value_str.len());
-                        let value = value_str[..end_pos]
-                            .trim()
-                            .trim_matches('"')
-                            .trim_matches('\'');
-                        if !value.is_empty() {
-                            cast_as = Some(value.to_string());
-                        }
-                    }
-                }
-
-                // Parse decimal(precision = X, scale = Y)
+                // First: Parse decimal(precision = X, scale = Y, cast_as = "TYPE")
                 if let Some(decimal_pos) = tokens.find("decimal") {
                     let remaining = &tokens[decimal_pos..];
                     // Extract content inside parentheses: decimal(precision = 10, scale = 2)
@@ -268,9 +253,41 @@ impl StructSchemaParser {
                                 }
                             }
 
+                            // Extract cast_as from decimal(...) (NEW)
+                            if let Some(cast_pos) = params_str.find("cast_as") {
+                                let cast_remaining = &params_str[cast_pos..];
+                                if let Some(eq_pos) = cast_remaining.find('=') {
+                                    let value_str = &cast_remaining[eq_pos + 1..];
+                                    let end_pos = value_str.find(',').unwrap_or(value_str.len());
+                                    let value = value_str[..end_pos]
+                                        .trim()
+                                        .trim_matches('"')
+                                        .trim_matches('\'');
+                                    if !value.is_empty() {
+                                        cast_as = Some(value.to_string());
+                                    }
+                                }
+                            }
+
                             if let (Some(p), Some(s)) = (precision, scale) {
                                 decimal_precision = Some((p, s));
                             }
+                        }
+                    }
+                }
+
+                // Second: Parse separate #[crud(cast_as = "TYPE")] (takes precedence)
+                if let Some(cast_pos) = tokens.find("cast_as") {
+                    let remaining = &tokens[cast_pos..];
+                    if let Some(eq_pos) = remaining.find('=') {
+                        let value_str = &remaining[eq_pos + 1..];
+                        let end_pos = value_str.find(',').unwrap_or(value_str.len());
+                        let value = value_str[..end_pos]
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'');
+                        if !value.is_empty() {
+                            cast_as = Some(value.to_string());  // Overrides decimal() cast_as
                         }
                     }
                 }
@@ -348,6 +365,11 @@ impl StructSchemaParser {
             }
         }
 
+        // Apply default "TEXT" for decimal fields without cast_as (NEW)
+        if decimal_precision.is_some() && cast_as.is_none() {
+            cast_as = Some("TEXT".to_string());
+        }
+
         Ok((rename_from, data_migration, cast_as, decimal_precision))
     }
 
@@ -409,7 +431,7 @@ impl StructSchemaParser {
             "chrono::NaiveTime" | "NaiveTime" => "TIME".to_string(),
             "uuid::Uuid" | "Uuid" => "UUID".to_string(),
             "serde_json::Value" | "Value" | "JSON" => "JSONB".to_string(),
-            "bytes::Bytes" | "Bytes" | "Vec" | "u8" => "BYTEA".to_string(),
+            "bytes::Bytes" | "Bytes" => "BYTEA".to_string(),
             "rust_decimal::Decimal" | "Decimal" => "NUMERIC(18,6)".to_string(),
             "bigdecimal::BigDecimal" | "BigDecimal" => "NUMERIC(30,10)".to_string(),
             "num_bigint::BigInt" | "BigInt" => "NUMERIC".to_string(),
