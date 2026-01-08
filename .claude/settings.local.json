@@ -29,7 +29,12 @@
       "Bash(cargo install:*)",
       "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" timeout:*)",
       "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" timeout 120 cargo test:*)",
-      "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" timeout 120 cargo clean:*)"
+      "Bash(DATABASE_URL=\"postgres://alex:@127.0.0.1/test_sqlx_tokio\" timeout 120 cargo clean:*)",
+      "Bash(cargo tree:*)",
+      "Bash(rustc:*)",
+      "Bash(/tmp/proxy_poc:*)",
+      "Bash(/tmp/proxy_mvp:*)",
+      "WebSearch"
     ]
   }
 }

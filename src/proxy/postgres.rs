@@ -1,0 +1,177 @@
+// PostgreSQL Enhanced Query Implementation
+//
+// This module provides the PostgreSQL-specific implementation of the EnhancedQuery trait,
+// which wraps SQLx's QueryAs for PostgreSQL and provides automatic type conversion for
+// bind parameters (e.g., DECIMAL → String for NUMERIC columns).
+
+use sqlx::{Postgres, Encode, Type, Executor, query::QueryAs};
+use sqlx::database::HasArguments;
+use sqlx::postgres::PgRow;
+use std::future::Future;
+
+use crate::proxy::{BindProxy, BindValue, EnhancedQuery};
+
+/// Enhanced query wrapper for PostgreSQL SELECT queries with automatic type conversion.
+///
+/// This type wraps SQLx's `QueryAs` for PostgreSQL and provides the `bind_proxy` method,
+/// which automatically converts complex types (like DECIMAL) to database-compatible values.
+///
+/// # Type Parameters
+///
+/// * `'q` - Lifetime of the SQL query
+/// * `O` - Output type (the struct being selected)
+///
+/// # Example
+///
+/// ```ignore
+/// use sqlx_struct_enhanced::{EnhancedCrud, EnhancedCrudExt};
+/// use rust_decimal::Decimal;
+///
+/// // Automatically convert rust_decimal::Decimal to String
+/// let orders = Order::where_query_ext("amount BETWEEN {} AND {}")
+///     .bind_proxy(Decimal::from_str("100.00").unwrap())
+///     .bind_proxy(Decimal::from_str("200.00").unwrap())
+///     .fetch_all(&pool)
+///     .await?;
+/// ```
+pub struct EnhancedQueryAsPostgres<'q, O> {
+    inner: QueryAs<'q, Postgres, O, <Postgres as HasArguments<'q>>::Arguments>,
+}
+
+impl<'q, O> EnhancedQueryAsPostgres<'q, O>
+where
+    O: Send + Unpin,
+{
+    /// Create an enhanced query from a SQLx QueryAs
+    pub fn from_query_as(inner: QueryAs<'q, Postgres, O, <Postgres as HasArguments<'q>>::Arguments>) -> Self {
+        Self { inner }
+    }
+
+    /// Bind a value with automatic type conversion.
+    ///
+    /// This method accepts any type that implements `BindProxy` and automatically
+    /// converts it to a database-compatible value.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use rust_decimal::Decimal;
+    ///
+    /// let decimal = Decimal::from_str("123.456").unwrap();
+    /// query.bind_proxy(decimal)  // auto-converts to String
+    ///     .fetch_one(&pool)
+    ///     .await?;
+    /// ```
+    pub fn bind_proxy<T: BindProxy<Postgres>>(mut self, value: T) -> Self
+    where
+        T: Clone,
+    {
+        let bind_value = value.into_bind_value();
+        self = match bind_value {
+            BindValue::String(s) => self.bind(s),
+            BindValue::I32(i) => self.bind(i),
+            BindValue::I64(i) => self.bind(i),
+            BindValue::F64(f) => self.bind(f),
+            BindValue::Bool(b) => self.bind(b),
+            BindValue::Decimal(s) => self.bind(s),
+            BindValue::_Marker(_) => panic!("BindValue::_Marker should never be used"),
+        };
+        self
+    }
+
+    /// Bind a value without conversion (standard SQLx behavior).
+    ///
+    /// This method is equivalent to SQLx's `bind` method and is provided for
+    /// backward compatibility.
+    pub fn bind<T: Encode<'q, Postgres> + Type<Postgres> + Send + 'q>(mut self, value: T) -> Self {
+        self.inner = self.inner.bind(value);
+        self
+    }
+}
+
+// ============================================================================
+// Implement EnhancedQuery trait for PostgreSQL
+// ============================================================================
+
+impl<'q, O> EnhancedQuery<'q, Postgres, O> for EnhancedQueryAsPostgres<'q, O>
+where
+    O: Send + Unpin + for<'r> sqlx::FromRow<'r, PgRow> + sqlx::Decode<'q, Postgres> + sqlx::Type<Postgres>,
+{
+    fn from_query_as(inner: QueryAs<'q, Postgres, O, <Postgres as HasArguments<'q>>::Arguments>) -> Self {
+        Self { inner }
+    }
+
+    fn bind_proxy<T: BindProxy<Postgres>>(mut self, value: T) -> Self
+    where
+        T: Clone,
+    {
+        let bind_value = value.into_bind_value();
+        match bind_value {
+            BindValue::String(s) => {
+                self.inner = self.inner.bind(s);
+                self
+            }
+            BindValue::I32(i) => {
+                self.inner = self.inner.bind(i);
+                self
+            }
+            BindValue::I64(i) => {
+                self.inner = self.inner.bind(i);
+                self
+            }
+            BindValue::F64(f) => {
+                self.inner = self.inner.bind(f);
+                self
+            }
+            BindValue::Bool(b) => {
+                self.inner = self.inner.bind(b);
+                self
+            }
+            BindValue::Decimal(s) => {
+                self.inner = self.inner.bind(s);
+                self
+            }
+            BindValue::_Marker(_) => {
+                panic!("BindValue::_Marker should never be used");
+            }
+        }
+    }
+
+    fn bind<T: Encode<'q, Postgres> + Type<Postgres> + Send + 'q>(mut self, value: T) -> Self {
+        self.inner = self.inner.bind(value);
+        self
+    }
+
+    fn fetch_one<'e, E>(self, executor: E) -> impl Future<Output = Result<O, sqlx::Error>>
+    where
+        'q: 'e,
+        O: 'e,
+        E: Executor<'e, Database = Postgres>,
+    {
+        async move {
+            self.inner.fetch_one(executor).await
+        }
+    }
+
+    fn fetch_optional<'e, E>(self, executor: E) -> impl Future<Output = Result<Option<O>, sqlx::Error>>
+    where
+        'q: 'e,
+        O: 'e,
+        E: Executor<'e, Database = Postgres>,
+    {
+        async move {
+            self.inner.fetch_optional(executor).await
+        }
+    }
+
+    fn fetch_all<'e, E>(self, executor: E) -> impl Future<Output = Result<Vec<O>, sqlx::Error>>
+    where
+        'q: 'e,
+        O: 'e,
+        E: Executor<'e, Database = Postgres>,
+    {
+        async move {
+            self.inner.fetch_all(executor).await
+        }
+    }
+}

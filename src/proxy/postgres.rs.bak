@@ -1,0 +1,336 @@
+// ============================================================================
+// Query Proxy - Simplified Concrete Implementation (PostgreSQL)
+// ============================================================================
+//
+// This module provides automatic type conversion for query parameters,
+// focusing on PostgreSQL with concrete types to avoid complex generics.
+
+use sqlx::{Postgres, Encode, Type, Executor, FromRow, query::{Query, QueryAs}};
+use sqlx::database::HasArguments;
+use sqlx::postgres::PgRow;
+
+// ============================================================================
+// BindValue Enum - Holds converted values ready for binding
+// ============================================================================
+
+/// Values that can be bound to PostgreSQL queries with automatic type conversion.
+#[derive(Debug, Clone)]
+pub enum BindValue {
+    String(String),
+    I32(i32),
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    /// DECIMAL type converted to String for PostgreSQL NUMERIC columns
+    Decimal(String),
+}
+
+impl BindValue {
+    /// Get a debug representation
+    pub fn debug(&self) -> String {
+        match self {
+            BindValue::String(s) => format!("String(\"{}\")", s),
+            BindValue::I32(i) => format!("i32({})", i),
+            BindValue::I64(i) => format!("i64({})", i),
+            BindValue::F64(f) => format!("f64({})", f),
+            BindValue::Bool(b) => format!("bool({})", b),
+            BindValue::Decimal(s) => format!("Decimal(\"{}\") [converted]", s),
+        }
+    }
+}
+
+// ============================================================================
+// BindProxy Trait - Enables type conversion
+// ============================================================================
+
+/// Trait for types that can be converted to bind values with automatic type conversion.
+///
+/// Implement this trait for custom types to enable automatic conversion when using
+/// `bind_proxy` on enhanced queries.
+///
+/// # Example
+///
+/// ```ignore
+/// use sqlx_struct_enhanced::proxy::BindProxy;
+///
+/// impl BindProxy for rust_decimal::Decimal {
+///     fn into_bind_value(self) -> BindValue {
+///         BindValue::Decimal(self.to_string())
+///     }
+/// }
+/// ```
+pub trait BindProxy {
+    fn into_bind_value(self) -> BindValue;
+}
+
+// Implement BindProxy for basic types (pass-through)
+impl BindProxy for String {
+    fn into_bind_value(self) -> BindValue {
+        BindValue::String(self)
+    }
+}
+
+impl BindProxy for i32 {
+    fn into_bind_value(self) -> BindValue {
+        BindValue::I32(self)
+    }
+}
+
+impl BindProxy for i64 {
+    fn into_bind_value(self) -> BindValue {
+        BindValue::I64(self)
+    }
+}
+
+impl BindProxy for f64 {
+    fn into_bind_value(self) -> BindValue {
+        BindValue::F64(self)
+    }
+}
+
+impl BindProxy for bool {
+    fn into_bind_value(self) -> BindValue {
+        BindValue::Bool(self)
+    }
+}
+
+// Reference implementations
+impl<'a> BindProxy for &'a str {
+    fn into_bind_value(self) -> BindValue {
+        BindValue::String(self.to_string())
+    }
+}
+
+// ============================================================================
+// EnhancedQueryAsPostgres - Wrapper for QueryAs with auto-conversion
+// ============================================================================
+
+/// Enhanced query wrapper that provides automatic type conversion for SELECT queries.
+///
+/// This type wraps SQLx's `QueryAs` for PostgreSQL and provides the `bind_proxy` method,
+/// which automatically converts complex types (like DECIMAL) to database-compatible values.
+///
+/// # Type Parameters
+///
+/// * `'q` - Lifetime of the SQL query
+/// * `O` - Output type (the struct being selected)
+///
+/// # Example
+///
+/// ```ignore
+/// use sqlx_struct_enhanced::{EnhancedCrud, EnhancedCrudExt};
+/// use rust_decimal::Decimal;
+///
+/// // Automatically convert rust_decimal::Decimal to String
+/// let orders = Order::where_query_ext("amount BETWEEN {} AND {}")
+///     .bind_proxy(Decimal::from_str("100.00").unwrap())
+///     .bind_proxy(Decimal::from_str("200.00").unwrap())
+///     .fetch_all(&pool)
+///     .await?;
+/// ```
+pub struct EnhancedQueryAsPostgres<'q, O> {
+    inner: QueryAs<'q, Postgres, O, <Postgres as HasArguments<'q>>::Arguments>,
+}
+
+impl<'q, O> EnhancedQueryAsPostgres<'q, O>
+where
+    O: Send + Unpin,
+{
+    /// Create an enhanced query from a SQLx QueryAs
+    pub fn from_query_as(inner: QueryAs<'q, Postgres, O, <Postgres as HasArguments<'q>>::Arguments>) -> Self {
+        Self { inner }
+    }
+
+    /// Bind a value with automatic type conversion.
+    ///
+    /// This method accepts any type that implements `BindProxy` and automatically
+    /// converts it to a database-compatible value.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use rust_decimal::Decimal;
+    ///
+    /// let decimal = Decimal::from_str("123.456").unwrap();
+    /// query.bind_proxy(decimal)  // auto-converts to String
+    ///     .fetch_one(&pool)
+    ///     .await?;
+    /// ```
+    pub fn bind_proxy<T: BindProxy>(mut self, value: T) -> Self
+    where
+        T: Clone,
+    {
+        let bind_value = value.into_bind_value();
+        self = match bind_value {
+            BindValue::String(s) => self.bind(s),
+            BindValue::I32(i) => self.bind(i),
+            BindValue::I64(i) => self.bind(i),
+            BindValue::F64(f) => self.bind(f),
+            BindValue::Bool(b) => self.bind(b),
+            BindValue::Decimal(s) => self.bind(s),
+        };
+        self
+    }
+
+    /// Bind a value without conversion (standard SQLx behavior).
+    ///
+    /// This method is equivalent to SQLx's `bind` method and is provided for
+    /// backward compatibility.
+    pub fn bind<T: Encode<'q, Postgres> + Type<Postgres> + Send + 'q>(mut self, value: T) -> Self {
+        self.inner = self.inner.bind(value);
+        self
+    }
+}
+
+// Forward fetch methods
+impl<'q, O> EnhancedQueryAsPostgres<'q, O>
+where
+    O: Send + Unpin + for<'r> FromRow<'r, PgRow> + sqlx::Decode<'q, Postgres> + sqlx::Type<Postgres>,
+{
+    /// Execute the query and return exactly one row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query returns no rows or more than one row.
+    pub async fn fetch_one<'e, E>(self, executor: E) -> Result<O, sqlx::Error>
+    where
+        'q: 'e,
+        E: Executor<'e, Database = Postgres>,
+    {
+        self.inner.fetch_one(executor).await
+    }
+
+    /// Execute the query and return at most one row.
+    ///
+    /// Returns `Ok(None)` if the query returns no rows.
+    pub async fn fetch_optional<'e, E>(self, executor: E) -> Result<Option<O>, sqlx::Error>
+    where
+        'q: 'e,
+        E: Executor<'e, Database = Postgres>,
+    {
+        self.inner.fetch_optional(executor).await
+    }
+
+    /// Execute the query and return all rows.
+    pub async fn fetch_all<'e, E>(self, executor: E) -> Result<Vec<O>, sqlx::Error>
+    where
+        'q: 'e,
+        E: Executor<'e, Database = Postgres>,
+    {
+        self.inner.fetch_all(executor).await
+    }
+}
+
+// ============================================================================
+// Optional rust_decimal support
+// ============================================================================
+
+#[cfg(feature = "decimal")]
+impl BindProxy for rust_decimal::Decimal {
+    fn into_bind_value(self) -> BindValue {
+        // Convert DECIMAL to String for PostgreSQL NUMERIC columns
+        BindValue::Decimal(self.to_string())
+    }
+}
+
+#[cfg(feature = "decimal")]
+impl<'a> BindProxy for &'a rust_decimal::Decimal {
+    fn into_bind_value(self) -> BindValue {
+        BindValue::Decimal(self.to_string())
+    }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bind_value_string() {
+        let value = BindValue::String("test".to_string());
+        assert_eq!(value.debug(), "String(\"test\")");
+    }
+
+    #[test]
+    fn test_bind_value_decimal() {
+        let value = BindValue::Decimal("123.456".to_string());
+        assert!(value.debug().contains("[converted]"));
+    }
+
+    #[test]
+    fn test_bind_proxy_string() {
+        let s = "hello".to_string();
+        let value = s.into_bind_value();
+        match value {
+            BindValue::String(s) => assert_eq!(s, "hello"),
+            _ => panic!("Expected String variant"),
+        }
+    }
+
+    #[test]
+    fn test_bind_proxy_i32() {
+        let i = 42;
+        let value = i.into_bind_value();
+        match value {
+            BindValue::I32(v) => assert_eq!(v, 42),
+            _ => panic!("Expected I32 variant"),
+        }
+    }
+
+    #[test]
+    fn test_bind_proxy_f64() {
+        let f = 123.456;
+        let value = f.into_bind_value();
+        match value {
+            BindValue::F64(v) => assert_eq!(v, 123.456),
+            _ => panic!("Expected F64 variant"),
+        }
+    }
+
+    #[test]
+    fn test_bind_proxy_str_ref() {
+        let s = "hello";
+        let value = s.into_bind_value();
+        match value {
+            BindValue::String(s) => assert_eq!(s, "hello"),
+            _ => panic!("Expected String variant"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "decimal")]
+    fn test_bind_proxy_decimal() {
+        use rust_decimal::Decimal;
+        let d = Decimal::from_str_exact("99.99").unwrap();
+        let value = d.into_bind_value();
+        match value {
+            BindValue::Decimal(s) => assert_eq!(s, "99.99"),
+            _ => panic!("Expected Decimal variant"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "decimal")]
+    fn test_bind_proxy_decimal_ref() {
+        use rust_decimal::Decimal;
+        let d = Decimal::from_str_exact("123.456").unwrap();
+        let value = (&d).into_bind_value();
+        match value {
+            BindValue::Decimal(s) => assert_eq!(s, "123.456"),
+            _ => panic!("Expected Decimal variant"),
+        }
+    }
+
+    #[test]
+    fn test_bind_proxy_bool() {
+        let b = true;
+        let value = b.into_bind_value();
+        match value {
+            BindValue::Bool(v) => assert_eq!(v, true),
+            _ => panic!("Expected Bool variant"),
+        }
+    }
+}

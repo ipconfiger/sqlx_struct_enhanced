@@ -10,6 +10,18 @@ use sqlx::mysql::MySql;
 #[cfg(feature = "sqlite")]
 use sqlx::sqlite::Sqlite;
 
+// Re-export the concrete proxy types for PostgreSQL
+#[cfg(feature = "postgres")]
+pub use crate::proxy::{EnhancedQueryAsPostgres, BindProxy, BindValue};
+
+// Re-export the concrete proxy types for MySQL
+#[cfg(all(feature = "mysql", not(feature = "postgres")))]
+pub use crate::proxy::{EnhancedQueryAsMySql, BindProxy, BindValue};
+
+// Re-export the concrete proxy types for SQLite
+#[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+pub use crate::proxy::{EnhancedQueryAsSqlite, BindProxy, BindValue};
+
 #[cfg(feature = "postgres")]
 pub trait EnhancedCrud {
     fn insert_bind(&mut self) -> Query<'_, Postgres, <Postgres as HasArguments<'_>>::Arguments>;
@@ -59,4 +71,301 @@ pub trait EnhancedCrud {
     fn bulk_insert(items: &[Self]) -> Query<'_, Sqlite, <Sqlite as HasArguments<'_>>::Arguments> where Self: Sized;
     fn bulk_update(items: &[Self]) -> Query<'_, Sqlite, <Sqlite as HasArguments<'_>>::Arguments> where Self: Sized;
     fn bulk_select(ids: &[String]) -> QueryAs<'_, Sqlite, Self, <Sqlite as HasArguments<'_>>::Arguments> where Self: Sized;
+}
+
+// ============================================================================
+// Enhanced CRUD Extension Trait (PostgreSQL - Concrete Types)
+// ============================================================================
+
+/// Extension trait that provides enhanced query methods with automatic type conversion.
+///
+/// This trait provides `_ext` versions of query methods that return concrete
+/// `EnhancedQueryAsPostgres` wrappers, which support the `bind_proxy` method
+/// for automatic type conversion.
+///
+/// # Note
+///
+/// Only SELECT/FETCH methods are included because they return data that may
+/// need type conversion (e.g., DECIMAL → String). Methods that use `execute()`
+/// (INSERT/UPDATE/DELETE) are not included since they don't return data.
+///
+/// # Example
+///
+/// ```ignore
+/// use sqlx_struct_enhanced::{EnhancedCrud, EnhancedCrudExt};
+/// use rust_decimal::Decimal;
+///
+/// // Use enhanced queries with automatic DECIMAL conversion
+/// let orders = Order::where_query_ext("amount BETWEEN {} AND {}")
+///     .bind_proxy(Decimal::from_str("100.00").unwrap())
+///     .bind_proxy(Decimal::from_str("200.00").unwrap())
+///     .fetch_all(&pool)
+///     .await?;
+/// ```
+///
+/// This trait is automatically implemented for all types that implement `EnhancedCrud`.
+#[cfg(feature = "postgres")]
+pub trait EnhancedCrudExt: EnhancedCrud {
+    /// Enhanced version of `where_query` that returns a wrapper with `bind_proxy` support.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results = MyTable::where_query_ext("status = {}")
+    ///     .bind_proxy(MyStatus::Active)
+    ///     .fetch_all(&pool)
+    ///     .await?;
+    /// ```
+    fn where_query_ext(statement: &str) -> EnhancedQueryAsPostgres<'_, Self>
+    where
+        Self: Sized;
+
+    /// Enhanced version of `by_pk` that returns a wrapper with `bind_proxy` support.
+    fn by_pk_ext<'q>() -> EnhancedQueryAsPostgres<'q, Self>
+    where
+        Self: Sized;
+
+    /// Enhanced version of `make_query` that returns a wrapper with `bind_proxy` support.
+    fn make_query_ext(sql: &str) -> EnhancedQueryAsPostgres<'_, Self>
+    where
+        Self: Sized;
+
+    /// Enhanced version of `count_query` that returns a wrapper with `bind_proxy` support.
+    fn count_query_ext(statement: &str) -> EnhancedQueryAsPostgres<'_, (i64,)>
+    where
+        Self: Sized;
+}
+
+// Blanket implementation for all EnhancedCrud types (PostgreSQL only)
+#[cfg(feature = "postgres")]
+impl<T: EnhancedCrud + Unpin + Send> EnhancedCrudExt for T {
+    fn where_query_ext(statement: &str) -> EnhancedQueryAsPostgres<'_, T>
+    where
+        T: Sized,
+    {
+        let query = T::where_query(statement);
+        EnhancedQueryAsPostgres::from_query_as(query)
+    }
+
+    fn by_pk_ext<'q>() -> EnhancedQueryAsPostgres<'q, T>
+    where
+        T: Sized,
+    {
+        let query = T::by_pk();
+        EnhancedQueryAsPostgres::from_query_as(query)
+    }
+
+    fn make_query_ext(sql: &str) -> EnhancedQueryAsPostgres<'_, T>
+    where
+        T: Sized,
+    {
+        let query = T::make_query(sql);
+        EnhancedQueryAsPostgres::from_query_as(query)
+    }
+
+    fn count_query_ext(statement: &str) -> EnhancedQueryAsPostgres<'_, (i64,)>
+    where
+        T: Sized,
+    {
+        let query = T::count_query(statement);
+        EnhancedQueryAsPostgres::from_query_as(query)
+    }
+}
+
+// ============================================================================
+// Enhanced CRUD Extension Trait (MySQL - Concrete Types)
+// ============================================================================
+
+/// Extension trait that provides enhanced query methods with automatic type conversion.
+///
+/// This trait provides `_ext` versions of query methods that return concrete
+/// `EnhancedQueryAsMySql` wrappers, which support the `bind_proxy` method
+/// for automatic type conversion.
+///
+/// # Note
+///
+/// Only SELECT/FETCH methods are included because they return data that may
+/// need type conversion (e.g., DECIMAL → String). Methods that use `execute()`
+/// (INSERT/UPDATE/DELETE) are not included since they don't return data.
+///
+/// # Example
+///
+/// ```ignore
+/// use sqlx_struct_enhanced::{EnhancedCrud, EnhancedCrudExt};
+/// use rust_decimal::Decimal;
+///
+/// // Use enhanced queries with automatic DECIMAL conversion
+/// let orders = Order::where_query_ext("amount BETWEEN {} AND {}")
+///     .bind_proxy(Decimal::from_str("100.00").unwrap())
+///     .bind_proxy(Decimal::from_str("200.00").unwrap())
+///     .fetch_all(&pool)
+///     .await?;
+/// ```
+///
+/// This trait is automatically implemented for all types that implement `EnhancedCrud`.
+#[cfg(all(feature = "mysql", not(feature = "postgres"), not(feature = "sqlite")))]
+pub trait EnhancedCrudExt: EnhancedCrud {
+    /// Enhanced version of `where_query` that returns a wrapper with `bind_proxy` support.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results = MyTable::where_query_ext("status = {}")
+    ///     .bind_proxy(MyStatus::Active)
+    ///     .fetch_all(&pool)
+    ///     .await?;
+    /// ```
+    fn where_query_ext(statement: &str) -> EnhancedQueryAsMySql<'_, Self>
+    where
+        Self: Sized;
+
+    /// Enhanced version of `by_pk` that returns a wrapper with `bind_proxy` support.
+    fn by_pk_ext<'q>() -> EnhancedQueryAsMySql<'q, Self>
+    where
+        Self: Sized;
+
+    /// Enhanced version of `make_query` that returns a wrapper with `bind_proxy` support.
+    fn make_query_ext(sql: &str) -> EnhancedQueryAsMySql<'_, Self>
+    where
+        Self: Sized;
+
+    /// Enhanced version of `count_query` that returns a wrapper with `bind_proxy` support.
+    fn count_query_ext(statement: &str) -> EnhancedQueryAsMySql<'_, (i64,)>
+    where
+        Self: Sized;
+}
+
+// Blanket implementation for all EnhancedCrud types (MySQL only)
+#[cfg(all(feature = "mysql", not(feature = "postgres"), not(feature = "sqlite")))]
+impl<T: EnhancedCrud + Unpin + Send> EnhancedCrudExt for T {
+    fn where_query_ext(statement: &str) -> EnhancedQueryAsMySql<'_, T>
+    where
+        T: Sized,
+    {
+        let query = T::where_query(statement);
+        EnhancedQueryAsMySql::from_query_as(query)
+    }
+
+    fn by_pk_ext<'q>() -> EnhancedQueryAsMySql<'q, T>
+    where
+        T: Sized,
+    {
+        let query = T::by_pk();
+        EnhancedQueryAsMySql::from_query_as(query)
+    }
+
+    fn make_query_ext(sql: &str) -> EnhancedQueryAsMySql<'_, T>
+    where
+        T: Sized,
+    {
+        let query = T::make_query(sql);
+        EnhancedQueryAsMySql::from_query_as(query)
+    }
+
+    fn count_query_ext(statement: &str) -> EnhancedQueryAsMySql<'_, (i64,)>
+    where
+        T: Sized,
+    {
+        let query = T::count_query(statement);
+        EnhancedQueryAsMySql::from_query_as(query)
+    }
+}
+
+// ============================================================================
+// Enhanced CRUD Extension Trait (SQLite - Concrete Types)
+// ============================================================================
+
+/// Extension trait that provides enhanced query methods with automatic type conversion.
+///
+/// This trait provides `_ext` versions of query methods that return concrete
+/// `EnhancedQueryAsSqlite` wrappers, which support the `bind_proxy` method
+/// for automatic type conversion.
+///
+/// # Note
+///
+/// Only SELECT/FETCH methods are included because they return data that may
+/// need type conversion (e.g., DECIMAL → String). Methods that use `execute()`
+/// (INSERT/UPDATE/DELETE) are not included since they don't return data.
+///
+/// # Example
+///
+/// ```ignore
+/// use sqlx_struct_enhanced::{EnhancedCrud, EnhancedCrudExt};
+/// use rust_decimal::Decimal;
+///
+/// // Use enhanced queries with automatic DECIMAL conversion
+/// let orders = Order::where_query_ext("amount BETWEEN {} AND {}")
+///     .bind_proxy(Decimal::from_str("100.00").unwrap())
+///     .bind_proxy(Decimal::from_str("200.00").unwrap())
+///     .fetch_all(&pool)
+///     .await?;
+/// ```
+///
+/// This trait is automatically implemented for all types that implement `EnhancedCrud`.
+#[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+pub trait EnhancedCrudExt: EnhancedCrud {
+    /// Enhanced version of `where_query` that returns a wrapper with `bind_proxy` support.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results = MyTable::where_query_ext("status = {}")
+    ///     .bind_proxy(MyStatus::Active)
+    ///     .fetch_all(&pool)
+    ///     .await?;
+    /// ```
+    fn where_query_ext(statement: &str) -> EnhancedQueryAsSqlite<'_, Self>
+    where
+        Self: Sized;
+
+    /// Enhanced version of `by_pk` that returns a wrapper with `bind_proxy` support.
+    fn by_pk_ext<'q>() -> EnhancedQueryAsSqlite<'q, Self>
+    where
+        Self: Sized;
+
+    /// Enhanced version of `make_query` that returns a wrapper with `bind_proxy` support.
+    fn make_query_ext(sql: &str) -> EnhancedQueryAsSqlite<'_, Self>
+    where
+        Self: Sized;
+
+    /// Enhanced version of `count_query` that returns a wrapper with `bind_proxy` support.
+    fn count_query_ext(statement: &str) -> EnhancedQueryAsSqlite<'_, (i64,)>
+    where
+        Self: Sized;
+}
+
+// Blanket implementation for all EnhancedCrud types (SQLite only)
+#[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+impl<T: EnhancedCrud + Unpin + Send> EnhancedCrudExt for T {
+    fn where_query_ext(statement: &str) -> EnhancedQueryAsSqlite<'_, T>
+    where
+        T: Sized,
+    {
+        let query = T::where_query(statement);
+        EnhancedQueryAsSqlite::from_query_as(query)
+    }
+
+    fn by_pk_ext<'q>() -> EnhancedQueryAsSqlite<'q, T>
+    where
+        T: Sized,
+    {
+        let query = T::by_pk();
+        EnhancedQueryAsSqlite::from_query_as(query)
+    }
+
+    fn make_query_ext(sql: &str) -> EnhancedQueryAsSqlite<'_, T>
+    where
+        T: Sized,
+    {
+        let query = T::make_query(sql);
+        EnhancedQueryAsSqlite::from_query_as(query)
+    }
+
+    fn count_query_ext(statement: &str) -> EnhancedQueryAsSqlite<'_, (i64,)>
+    where
+        T: Sized,
+    {
+        let query = T::count_query(statement);
+        EnhancedQueryAsSqlite::from_query_as(query)
+    }
 }

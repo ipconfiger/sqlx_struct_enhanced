@@ -1,6 +1,8 @@
 pub mod traits;
+pub mod proxy;
 pub use sqlx_struct_macros::EnhancedCrud;
-pub use traits::EnhancedCrud;
+pub use traits::{EnhancedCrud, EnhancedCrudExt};
+pub use proxy::{EnhancedQueryAsPostgres, BindProxy, BindValue};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -14,7 +16,7 @@ use sqlx::mysql::{MySqlPool, MySql};
 #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
 use sqlx::sqlite::{SqlitePool, Sqlite};
 
-use sqlx::Transaction;
+use sqlx::{Database, Transaction, query::{Query, QueryAs}, Encode, Type, Decode};
 use futures::Future;
 
 /// Transaction helper that executes a function within a database transaction.
