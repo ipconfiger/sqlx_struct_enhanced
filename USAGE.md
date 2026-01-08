@@ -72,6 +72,204 @@ let users = User::where_query("age > 25").fetch_all(&pool).await?;
 let (count,) = User::count_query("age > 25").fetch_one(&pool).await?;
 ```
 
+## Supported Data Types with BindProxy
+
+The `bind_proxy` method provides automatic type conversion for complex Rust types when binding parameters to queries. This feature is essential when working with types that don't natively map to database types.
+
+### Enabling Extended Type Support
+
+To use extended data types, enable the appropriate feature flags:
+
+```toml
+[dependencies]
+sqlx_struct_enhanced = { version = "0.1", features = ["postgres", "all-types"] }
+# Or enable individual features:
+# sqlx_struct_enhanced = { version = "0.1", features = ["postgres", "chrono", "json", "uuid"] }
+```
+
+**Available Features:**
+- `decimal` - Rust `Decimal` type (via `rust_decimal` crate)
+- `chrono` - Date and time types (via `chrono` crate)
+- `json` - JSON type (via `serde_json` crate)
+- `uuid` - UUID type (via `uuid` crate)
+- `all-types` - Enables all of the above
+
+### Basic Types (No Feature Required)
+
+These types work without any feature flags:
+
+**Signed Integers:**
+- `i8`, `i16`, `i32`, `i64` - Direct binding (zero overhead)
+
+**Floating Point:**
+- `f32`, `f64` - Direct binding (zero overhead)
+
+**Binary Data:**
+- `Vec<u8>`, `&[u8]` - Direct binding (zero overhead)
+
+**Other:**
+- `String`, `&str` - Native string types
+- `bool` - Boolean values
+
+### Extended Types (Feature-Gated)
+
+#### Unsigned Integers → String Conversion
+
+**Note:** SQLx doesn't natively support unsigned integers for all databases. These types automatically convert to String:
+
+```rust
+use sqlx_struct_enhanced::EnhancedCrudExt;
+
+// u8, u16, u32, u64 automatically convert to String
+let users = User::where_query("age_group = {}")
+    .bind_proxy(255u8)       // → String "255"
+    .bind_proxy(65535u16)    // → String "65535"
+    .bind_proxy(4294967295u32) // → String "4294967295"
+    .bind_proxy(18446744073709551615u64) // → String "18446744073709551615"
+    .fetch_all(&pool)
+    .await?;
+```
+
+#### Chrono Date/Time Types (Feature: `chrono`)
+
+All chrono types convert to ISO 8601 string format:
+
+```rust
+use chrono::{NaiveDate, NaiveTime, NaiveDateTime, Utc};
+
+// NaiveDate → "YYYY-MM-DD"
+let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+let events = Event::where_query("event_date >= {}")
+    .bind_proxy(date)  // → "2024-01-15"
+    .fetch_all(&pool)
+    .await?;
+
+// NaiveTime → "HH:MM:SS.nnnnnnnnn"
+let time = NaiveTime::from_hms_opt(14, 30, 0).unwrap();
+let schedules = Schedule::where_query("start_time = {}")
+    .bind_proxy(time)  // → "14:30:00.000000000"
+    .fetch_all(&pool)
+    .await?;
+
+// NaiveDateTime → "YYYY-MM-DD HH:MM:SS.nnnnnnnnn"
+let dt = NaiveDateTime::from_timestamp_opt(1704067200, 0).unwrap();
+let logs = Log::where_query("created_at >= {}")
+    .bind_proxy(dt)  // → "2024-01-01 00:00:00.000000000"
+    .fetch_all(&pool)
+    .await?;
+
+// DateTime<Utc> → "YYYY-MM-DD HH:MM:SS.nnnnnnnnn+00:00"
+let utc_dt = Utc::now();
+let orders = Order::where_query("order_date = {}")
+    .bind_proxy(utc_dt)
+    .fetch_all(&pool)
+    .await?;
+```
+
+#### UUID Type (Feature: `uuid`)
+
+```rust
+use uuid::Uuid;
+
+let user_id = Uuid::new_v4();
+let users = User::where_query("id = {}")
+    .bind_proxy(user_id)  // → UUID string format
+    .fetch_one(&pool)
+    .await?;
+
+// Parse UUID from string
+let id = Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000")?;
+let users = User::where_query("parent_id = {}")
+    .bind_proxy(id)
+    .fetch_all(&pool)
+    .await?;
+```
+
+#### JSON Type (Feature: `json`)
+
+```rust
+use serde_json::json;
+
+let metadata = json!({
+    "name": "John Doe",
+    "age": 30,
+    "tags": ["vip", "premium"]
+});
+
+let users = User::where_query("metadata = {}")
+    .bind_proxy(metadata)  // → JSON string
+    .fetch_all(&pool)
+    .await?;
+
+// Query with JSON contains
+let search_term = json!({"vip": true});
+let users = User::where_query("metadata LIKE {}")
+    .bind_proxy("%\"vip\": true%")
+    .fetch_all(&pool)
+    .await?;
+```
+
+#### Decimal Type (Feature: `decimal`)
+
+```rust
+use rust_decimal::Decimal;
+
+// For DECIMAL/NUMERIC columns
+let price = Decimal::from_str_exact("99.99").unwrap();
+let products = Product::where_query("price >= {}")
+    .bind_proxy(price)  // → String "99.99"
+    .fetch_all(&pool)
+    .await?;
+```
+
+### Type Conversion Summary
+
+| Rust Type | Database Type | Conversion | Feature | Overhead |
+|-----------|--------------|------------|---------|----------|
+| `i8`, `i16`, `i32`, `i64` | SMALLINT/INT/BIGINT | None | - | Zero |
+| `f32`, `f64` | REAL/DOUBLE | None | - | Zero |
+| `Vec<u8>`, `&[u8]` | BYTEA/BLOB | None | - | Zero |
+| `u8`, `u16`, `u32`, `u64` | TEXT | → String | - | Minimal |
+| `chrono::NaiveDate` | TEXT | → ISO 8601 | chrono | Minimal |
+| `chrono::NaiveTime` | TEXT | → ISO 8601 | chrono | Minimal |
+| `chrono::NaiveDateTime` | TEXT | → ISO 8601 | chrono | Minimal |
+| `chrono::DateTime<Utc>` | TEXT | → ISO 8601 | chrono | Minimal |
+| `uuid::Uuid` | TEXT/UUID | → String | uuid | Minimal |
+| `serde_json::Value` | TEXT/JSON | → JSON String | json | Minimal |
+| `rust_decimal::Decimal` | TEXT/NUMERIC | → String | decimal | Minimal |
+
+### Using bind_proxy with WHERE Queries
+
+The `bind_proxy` method works seamlessly with `where_query`:
+
+```rust
+use sqlx_struct_enhanced::EnhancedCrudExt;
+use chrono::NaiveDate;
+
+// Multiple type conversions in one query
+let results = Order::where_query("created_at >= {} AND total_amount >= {} AND status = {}")
+    .bind_proxy(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()) // Date
+    .bind_proxy(100.0f32)                                        // Float
+    .bind_proxy("pending")                                       // String
+    .fetch_all(&pool)
+    .await?;
+```
+
+### Performance Considerations
+
+1. **Direct binding is fastest**: Use signed integers (`i8`, `i16`, `i32`) instead of unsigned when possible
+2. **String conversions have minimal overhead**: The conversion cost is typically < 100ns per value
+3. **Type safety is maintained**: All conversions are type-safe and checked at compile time
+4. **Zero runtime overhead for native types**: `i8`, `i16`, `f32`, `f64`, `Vec<u8>` bind directly
+5. **Automatic SQL caching**: Repeated queries benefit from SQLx's prepared statement caching
+
+### Examples
+
+For comprehensive examples using all extended types, see:
+- `examples/extended_types_simple.rs` - Basic usage examples
+- `examples/extended_types_real_world.rs` - E-commerce scenario
+- `examples/extended_types_performance.rs` - Performance optimization guide
+
 ## API Reference
 
 ### Instance Methods (operate on struct instances)

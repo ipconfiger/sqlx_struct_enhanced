@@ -10,6 +10,7 @@ Auto-generate CRUD SQL operations for SQLx with type-safe query building.
 - ✅ **Conditional Operations**: WHERE queries, count queries, and conditional deletes
 - ✅ **Multiple Database Backends**: PostgreSQL, MySQL, SQLite
 - ✅ **DECIMAL/NUMERIC Support** 🆕: Type-safe decimal handling with automatic casting
+- ✅ **Extended BindProxy Types** 🆕: Auto-conversion for dates, JSON, binary, and more
 - ✅ **Compile-time SQL Generation**: No runtime overhead
 - ✅ **Global SQL Caching**: Efficient query reuse
 - ✅ **Custom Table Names**: Override default table names
@@ -135,6 +136,113 @@ println!("Price: {}", product.price.unwrap()); // "1299.99"
 - ✅ Automatic type casting in queries
 
 > **📖 For full DECIMAL documentation, see [DECIMAL_USAGE_GUIDE.md](DECIMAL_USAGE_GUIDE.md)**
+
+## Extended Data Types Support 🆕
+
+The `bind_proxy` method provides automatic type conversion for complex Rust types, making it easy to work with dates, JSON, binary data, and more.
+
+### Installation with Extended Types
+
+```toml
+[dependencies]
+sqlx_struct_enhanced = { version = "0.1", features = ["postgres", "all-types"] }
+# Or enable individual features:
+# sqlx_struct_enhanced = { version = "0.1", features = ["postgres", "chrono", "json", "uuid"] }
+```
+
+### Supported Types
+
+#### Additional Numeric Types (No Feature Required)
+```rust
+use sqlx_struct_enhanced::EnhancedCrudExt;
+
+// i8, i16, i32, i64 - Direct binding (zero overhead)
+let products = Product::where_query("stock_count = {}")
+    .bind_proxy(100i16)
+    .fetch_all(&pool)
+    .await?;
+
+// f32, f64 - Direct binding (zero overhead)
+let products = Product::where_query("rating >= {}")
+    .bind_proxy(4.5f32)
+    .fetch_all(&pool)
+    .await?;
+
+// u8, u16, u32, u64 - Auto-convert to String
+let users = User::where_query("age_group = {}")
+    .bind_proxy(255u8)  // → String "255"
+    .fetch_all(&pool)
+    .await?;
+
+// Vec<u8>, &[u8] - Direct binding (zero overhead)
+let files = File::where_query("data = {}")
+    .bind_proxy(vec![0x00, 0x01, 0x02])
+    .fetch_all(&pool)
+    .await?;
+```
+
+#### Chrono Date/Time Types (Feature: `chrono`)
+```rust
+use chrono::{NaiveDate, NaiveDateTime, Utc};
+
+// NaiveDate → ISO 8601 string
+let events = Event::where_query("event_date >= {}")
+    .bind_proxy(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap())
+    .fetch_all(&pool)
+    .await?;
+
+// NaiveDateTime → ISO 8601 string
+let logs = Log::where_query("created_at >= {}")
+    .bind_proxy(NaiveDateTime::from_timestamp_opt(1704067200, 0).unwrap())
+    .fetch_all(&pool)
+    .await?;
+
+// DateTime<Utc> → ISO 8601 with timezone
+let orders = Order::where_query("order_date = {}")
+    .bind_proxy(Utc::now())
+    .fetch_all(&pool)
+    .await?;
+```
+
+#### UUID Type (Feature: `uuid`)
+```rust
+use uuid::Uuid;
+
+let user_id = Uuid::new_v4();
+let users = User::where_query("id = {}")
+    .bind_proxy(user_id)  // → UUID string
+    .fetch_one(&pool)
+    .await?;
+```
+
+#### JSON Type (Feature: `json`)
+```rust
+use serde_json::json;
+
+let metadata = json!({
+    "name": "John Doe",
+    "tags": ["vip", "premium"]
+});
+
+let users = User::where_query("metadata = {}")
+    .bind_proxy(metadata)  // → JSON string
+    .fetch_all(&pool)
+    .await?;
+```
+
+### Type Conversion Summary
+
+| Rust Type | Conversion | Feature | Overhead |
+|-----------|------------|---------|----------|
+| `i8`, `i16`, `i32`, `i64` | None | - | Zero |
+| `f32`, `f64` | None | - | Zero |
+| `Vec<u8>`, `&[u8]` | None | - | Zero |
+| `u8`, `u16`, `u32`, `u64` | → String | - | Minimal |
+| `chrono::*` | → ISO 8601 | chrono | Minimal |
+| `uuid::Uuid` | → String | uuid | Minimal |
+| `serde_json::Value` | → JSON String | json | Minimal |
+
+> **📖 For complete documentation, see [USAGE.md](USAGE.md#supported-data-types-with-bindproxy)**
 
 ## Table Naming
 
@@ -556,6 +664,17 @@ See the `tests/` directory for complete examples:
   - `#[crud(cast_as = "TYPE")]` attribute for query-time type casting
   - Full integration test coverage
   - Bug fixes: SQL cache deadlock, attribute parsing, placeholder replacement
+- **Extended BindProxy Data Types** 🆕
+  - Additional numeric types: i8, i16, u8, u16, u32, u64, f32
+  - Chrono date/time types: NaiveDate, NaiveTime, NaiveDateTime, DateTime<Utc>
+  - UUID support with automatic string conversion
+  - JSON type support via serde_json
+  - Binary data support: Vec<u8>, &[u8]
+  - 93 comprehensive unit tests, all passing
+  - Zero overhead for native types (i8, i16, f32, f64, Vec<u8>)
+  - Minimal overhead for types requiring String conversion
+  - Cross-database consistency (PostgreSQL, MySQL, SQLite)
+  - Complete integration tests and example code
 - Phase 0: Compile-time index analysis (`analyze_queries` macro) 🆕
   - ✅ Day 1: Basic equality and ORDER BY analysis
   - ✅ Day 2: Enhanced pattern recognition (Range, IN, LIKE operators)
