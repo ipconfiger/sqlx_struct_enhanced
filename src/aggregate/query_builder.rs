@@ -524,6 +524,607 @@ impl<'a, DB: Database> AggQueryBuilder<'a, DB> {
     }
 }
 
+// ============ PostgreSQL-specific implementations ============
+
+#[cfg(feature = "postgres")]
+impl<'a> AggQueryBuilder<'a, sqlx::Postgres> {
+    // ============ New fetch methods for direct query execution ============
+
+    /// Execute query and return a single row.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (avg, count): (Option<f64>, i64) = Order::agg_query()
+    ///     .where_("engineer_id = {}", &[&id])
+    ///     .avg("score")
+    ///     .count()
+    ///     .fetch_one(&pool)
+    ///     .await?;
+    /// ```
+    pub async fn fetch_one<T>(
+        self,
+        pool: &sqlx::PgPool
+    ) -> Result<T, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Unpin + Send,
+    {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, T>(sql);
+
+        // Bind WHERE parameters
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        // Bind HAVING parameters
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        // Bind LIMIT parameter
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        // Bind OFFSET parameter
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        query.fetch_one(pool).await
+    }
+
+    /// Execute query and return all rows.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results: Vec<(String, i64)> = Order::agg_query()
+    ///     .group_by("status")
+    ///     .count()
+    ///     .fetch_all(&pool)
+    ///     .await?;
+    /// ```
+    pub async fn fetch_all<T>(
+        self,
+        pool: &sqlx::PgPool
+    ) -> Result<Vec<T>, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Unpin + Send,
+    {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, T>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        query.fetch_all(pool).await
+    }
+
+    /// Execute query and return optional result.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let maybe_count: Option<(i64,)> = User::agg_query()
+    ///     .where_("id = {}", &[&id])
+    ///     .count()
+    ///     .fetch_optional(&pool)
+    ///     .await?;
+    /// ```
+    pub async fn fetch_optional<T>(
+        self,
+        pool: &sqlx::PgPool
+    ) -> Result<Option<T>, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Unpin + Send,
+    {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, T>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        query.fetch_optional(pool).await
+    }
+
+    /// Convenience method for COUNT queries - automatically unwraps the tuple.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let count = User::agg_query()
+    ///     .where_("role = {}", &[&"admin"])
+    ///     .fetch_count(&pool)
+    ///     .await?;
+    /// ```
+    pub async fn fetch_count(
+        self,
+        pool: &sqlx::PgPool
+    ) -> Result<i64, sqlx::Error> {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, (i64,)>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        let (count,) = query.fetch_one(pool).await?;
+        Ok(count)
+    }
+
+    /// Convenience method for AVG queries - automatically unwraps the tuple.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let avg_score = Rating::agg_query()
+    ///     .where_("product_id = {}", &[&pid])
+    ///     .fetch_avg(&pool)
+    ///     .await?;
+    /// ```
+    pub async fn fetch_avg(
+        self,
+        pool: &sqlx::PgPool
+    ) -> Result<Option<f64>, sqlx::Error> {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, (Option<f64>,)>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        let (avg,) = query.fetch_one(pool).await?;
+        Ok(avg)
+    }
+
+    /// Convenience method for SUM queries - automatically unwraps the tuple.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let total = Order::agg_query()
+    ///     .where_("status = {}", &[&"paid"])
+    ///     .fetch_sum(&pool)
+    ///     .await?;
+    /// ```
+    pub async fn fetch_sum(
+        self,
+        pool: &sqlx::PgPool
+    ) -> Result<Option<f64>, sqlx::Error> {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, (Option<f64>,)>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        let (sum,) = query.fetch_one(pool).await?;
+        Ok(sum)
+    }
+}
+
+// ============ MySQL implementations ============
+
+#[cfg(feature = "mysql")]
+impl<'a> AggQueryBuilder<'a, sqlx::MySql> {
+    /// Execute query and return a single row.
+    pub async fn fetch_one<T>(
+        self,
+        pool: &sqlx::MySqlPool
+    ) -> Result<T, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow> + Unpin + Send,
+    {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, T>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as u64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as u64);
+        }
+
+        query.fetch_one(pool).await
+    }
+
+    /// Execute query and return all rows.
+    pub async fn fetch_all<T>(
+        self,
+        pool: &sqlx::MySqlPool
+    ) -> Result<Vec<T>, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow> + Unpin + Send,
+    {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, T>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as u64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as u64);
+        }
+
+        query.fetch_all(pool).await
+    }
+
+    /// Execute query and return optional result.
+    pub async fn fetch_optional<T>(
+        self,
+        pool: &sqlx::MySqlPool
+    ) -> Result<Option<T>, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow> + Unpin + Send,
+    {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, T>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as u64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as u64);
+        }
+
+        query.fetch_optional(pool).await
+    }
+
+    /// Convenience method for COUNT queries.
+    pub async fn fetch_count(
+        self,
+        pool: &sqlx::MySqlPool
+    ) -> Result<i64, sqlx::Error> {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, (i64,)>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as u64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as u64);
+        }
+
+        let (count,) = query.fetch_one(pool).await?;
+        Ok(count)
+    }
+
+    /// Convenience method for AVG queries.
+    pub async fn fetch_avg(
+        self,
+        pool: &sqlx::MySqlPool
+    ) -> Result<Option<f64>, sqlx::Error> {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, (Option<f64>,)>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as u64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as u64);
+        }
+
+        let (avg,) = query.fetch_one(pool).await?;
+        Ok(avg)
+    }
+
+    /// Convenience method for SUM queries.
+    pub async fn fetch_sum(
+        self,
+        pool: &sqlx::MySqlPool
+    ) -> Result<Option<f64>, sqlx::Error> {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, (Option<f64>,)>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as u64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as u64);
+        }
+
+        let (sum,) = query.fetch_one(pool).await?;
+        Ok(sum)
+    }
+}
+
+// ============ SQLite implementations ============
+
+#[cfg(feature = "sqlite")]
+impl<'a> AggQueryBuilder<'a, sqlx::Sqlite> {
+    /// Execute query and return a single row.
+    pub async fn fetch_one<T>(
+        self,
+        pool: &sqlx::SqlitePool
+    ) -> Result<T, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Unpin + Send,
+    {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, T>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        query.fetch_one(pool).await
+    }
+
+    /// Execute query and return all rows.
+    pub async fn fetch_all<T>(
+        self,
+        pool: &sqlx::SqlitePool
+    ) -> Result<Vec<T>, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Unpin + Send,
+    {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, T>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        query.fetch_all(pool).await
+    }
+
+    /// Execute query and return optional result.
+    pub async fn fetch_optional<T>(
+        self,
+        pool: &sqlx::SqlitePool
+    ) -> Result<Option<T>, sqlx::Error>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Unpin + Send,
+    {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, T>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        query.fetch_optional(pool).await
+    }
+
+    /// Convenience method for COUNT queries.
+    pub async fn fetch_count(
+        self,
+        pool: &sqlx::SqlitePool
+    ) -> Result<i64, sqlx::Error> {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, (i64,)>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        let (count,) = query.fetch_one(pool).await?;
+        Ok(count)
+    }
+
+    /// Convenience method for AVG queries.
+    pub async fn fetch_avg(
+        self,
+        pool: &sqlx::SqlitePool
+    ) -> Result<Option<f64>, sqlx::Error> {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, (Option<f64>,)>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        let (avg,) = query.fetch_one(pool).await?;
+        Ok(avg)
+    }
+
+    /// Convenience method for SUM queries.
+    pub async fn fetch_sum(
+        self,
+        pool: &sqlx::SqlitePool
+    ) -> Result<Option<f64>, sqlx::Error> {
+        let sql = self.build();
+        let mut query = sqlx::query_as::<_, (Option<f64>,)>(sql);
+
+        for param in &self.where_params {
+            query = query.bind(param);
+        }
+
+        for param in &self.having_params {
+            query = query.bind(param);
+        }
+
+        if let Some(n) = self.limit {
+            query = query.bind(n as i64);
+        }
+
+        if let Some(n) = self.offset {
+            query = query.bind(n as i64);
+        }
+
+        let (sum,) = query.fetch_one(pool).await?;
+        Ok(sum)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

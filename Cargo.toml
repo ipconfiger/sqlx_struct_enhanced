@@ -19,6 +19,7 @@ chrono = ["dep:chrono"]
 json = ["dep:serde_json"]
 uuid = ["dep:uuid"]
 all-types = ["decimal", "chrono", "json", "uuid"]
+join_queries = ["sqlx_struct_macros/join_queries"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -34,7 +35,7 @@ futures = "0.3"
 rust_decimal = { version = "1.32", optional = true }
 
 [dev-dependencies]
-sqlx_struct_enhanced =  { version = "*", path = ".", default-features = false, features = ["postgres"] }
-sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros"] }
+sqlx_struct_enhanced =  { version = "*", path = ".", default-features = false, features = ["postgres", "uuid"] }
+sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "uuid", "migrate"] }
 tokio-test = "0.4.2"
 serial_test = "3.0"

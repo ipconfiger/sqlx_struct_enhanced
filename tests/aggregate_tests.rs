@@ -4,6 +4,7 @@
 use sqlx_struct_enhanced::{EnhancedCrud, Scheme};
 use sqlx::{FromRow, Postgres, query::Query, query::QueryAs};
 use sqlx::database::HasArguments;
+use sqlx::Row;
 
 // Test struct for aggregation queries
 #[derive(Debug, Clone, PartialEq, FromRow, EnhancedCrud)]
@@ -471,5 +472,403 @@ fn test_chaining_preserves_state() {
     assert!(sql.contains("HAVING total > $2"));
     assert!(sql.contains("ORDER BY total DESC"));
     assert!(sql.contains("LIMIT $3"));
+}
+
+// ============================================================================
+// Integration Tests: New Fetch Methods
+// ============================================================================
+
+// Note: These tests require a running PostgreSQL database
+// They should be run with: cargo test --features postgres -- --ignored
+
+#[sqlx::test]
+async fn test_fetch_count_simple(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+    // Create test table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS test_users_count (
+            id VARCHAR PRIMARY KEY,
+            role VARCHAR NOT NULL
+        )"
+    )
+    .execute(&pool)
+    .await?;
+
+    // Insert test data
+    sqlx::query("INSERT INTO test_users_count (id, role) VALUES ($1, $2)")
+        .bind("user1")
+        .bind("admin")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO test_users_count (id, role) VALUES ($1, $2)")
+        .bind("user2")
+        .bind("admin")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO test_users_count (id, role) VALUES ($1, $2)")
+        .bind("user3")
+        .bind("user")
+        .execute(&pool)
+        .await?;
+
+    // Test fetch_count with specialized method
+    let count = TestUsersCount::agg_query()
+        .where_("role = {}", &[&"admin"])
+        .count()
+        .fetch_count(&pool)
+        .await?;
+
+    assert_eq!(count, 2);
+
+    // Cleanup
+    sqlx::query("DROP TABLE test_users_count")
+        .execute(&pool)
+        .await?;
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_fetch_one_with_tuple(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+    // Create test table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS test_rating (
+            id VARCHAR PRIMARY KEY,
+            engineer_id VARCHAR NOT NULL,
+            score DOUBLE PRECISION NOT NULL
+        )"
+    )
+    .execute(&pool)
+    .await?;
+
+    // Insert test data
+    sqlx::query("INSERT INTO test_rating (id, engineer_id, score) VALUES ($1, $2, $3)")
+        .bind("rating1")
+        .bind("eng1")
+        .bind(5.0)
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO test_rating (id, engineer_id, score) VALUES ($1, $2, $3)")
+        .bind("rating2")
+        .bind("eng1")
+        .bind(4.0)
+        .execute(&pool)
+        .await?;
+
+    // Test fetch_one with generic method (AVG + COUNT)
+    let (avg, count): (Option<f64>, i64) = TestRating::agg_query()
+        .where_("engineer_id = {}", &[&"eng1"])
+        .avg("score")
+        .count()
+        .fetch_one(&pool)
+        .await?;
+
+    assert_eq!(count, 2);
+    assert_eq!(avg, Some(4.5));
+
+    // Cleanup
+    sqlx::query("DROP TABLE test_rating")
+        .execute(&pool)
+        .await?;
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_fetch_all_group_by(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+    // Create test table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS test_order_status (
+            id VARCHAR PRIMARY KEY,
+            status VARCHAR NOT NULL,
+            amount INTEGER NOT NULL
+        )"
+    )
+    .execute(&pool)
+    .await?;
+
+    // Insert test data
+    sqlx::query("INSERT INTO test_order_status (id, status, amount) VALUES ($1, $2, $3)")
+        .bind("order1")
+        .bind("completed")
+        .bind(100)
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO test_order_status (id, status, amount) VALUES ($1, $2, $3)")
+        .bind("order2")
+        .bind("completed")
+        .bind(200)
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO test_order_status (id, status, amount) VALUES ($1, $2, $3)")
+        .bind("order3")
+        .bind("pending")
+        .bind(150)
+        .execute(&pool)
+        .await?;
+
+    // Test fetch_all with GROUP BY
+    let results: Vec<(String, i64)> = TestOrderStatus::agg_query()
+        .group_by("status")
+        .count()
+        .fetch_all(&pool)
+        .await?;
+
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|(status, count)| status == "completed" && *count == 2));
+    assert!(results.iter().any(|(status, count)| status == "pending" && *count == 1));
+
+    // Cleanup
+    sqlx::query("DROP TABLE test_order_status")
+        .execute(&pool)
+        .await?;
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_fetch_optional(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+    // Create test table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS test_item (
+            id VARCHAR PRIMARY KEY,
+            value INTEGER NOT NULL
+        )"
+    )
+    .execute(&pool)
+    .await?;
+
+    // Insert test data
+    sqlx::query("INSERT INTO test_item (id, value) VALUES ($1, $2)")
+        .bind("item1")
+        .bind(42)
+        .execute(&pool)
+        .await?;
+
+    // Test fetch_optional with existing data (use MIN which returns one row per group)
+    let result: Option<(Option<i32>,)> = TestItem::agg_query()
+        .where_("id = {}", &[&"item1"])
+        .min("value")
+        .fetch_optional(&pool)
+        .await?;
+
+    assert_eq!(result, Some((Some(42),)));
+
+    // Test fetch_optional with non-existing data (MIN returns NULL when no rows match)
+    let result: Option<(Option<i32>,)> = TestItem::agg_query()
+        .where_("id = {}", &[&"nonexistent"])
+        .min("value")
+        .fetch_optional(&pool)
+        .await?;
+
+    // MIN with no matching rows still returns one row with NULL value
+    assert_eq!(result, Some((None,)));
+
+    // Cleanup
+    sqlx::query("DROP TABLE test_item")
+        .execute(&pool)
+        .await?;
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_fetch_avg_specialized(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+    // Create test table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS test_score (
+            id VARCHAR PRIMARY KEY,
+            score DOUBLE PRECISION NOT NULL
+        )"
+    )
+    .execute(&pool)
+    .await?;
+
+    // Insert test data
+    sqlx::query("INSERT INTO test_score (id, score) VALUES ($1, $2)")
+        .bind("score1")
+        .bind(10.0)
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO test_score (id, score) VALUES ($1, $2)")
+        .bind("score2")
+        .bind(20.0)
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO test_score (id, score) VALUES ($1, $2)")
+        .bind("score3")
+        .bind(30.0)
+        .execute(&pool)
+        .await?;
+
+    // Test fetch_avg specialized method
+    let avg = TestScore::agg_query()
+        .avg("score")
+        .fetch_avg(&pool)
+        .await?;
+
+    assert_eq!(avg, Some(20.0));
+
+    // Cleanup
+    sqlx::query("DROP TABLE test_score")
+        .execute(&pool)
+        .await?;
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_fetch_sum_specialized(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+    // Create test table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS test_amount (
+            id VARCHAR PRIMARY KEY,
+            amount DOUBLE PRECISION NOT NULL
+        )"
+    )
+    .execute(&pool)
+    .await?;
+
+    // Insert test data
+    sqlx::query("INSERT INTO test_amount (id, amount) VALUES ($1, $2)")
+        .bind("amt1")
+        .bind(100.0)
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO test_amount (id, amount) VALUES ($1, $2)")
+        .bind("amt2")
+        .bind(200.0)
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO test_amount (id, amount) VALUES ($1, $2)")
+        .bind("amt3")
+        .bind(300.0)
+        .execute(&pool)
+        .await?;
+
+    // Test fetch_sum specialized method
+    let sum = TestAmount::agg_query()
+        .sum("amount")
+        .fetch_sum(&pool)
+        .await?;
+
+    assert_eq!(sum, Some(600.0));
+
+    // Cleanup
+    sqlx::query("DROP TABLE test_amount")
+        .execute(&pool)
+        .await?;
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_fetch_with_limit_offset(pool: sqlx::PgPool) -> Result<(), sqlx::Error> {
+    // Create test table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS test_pagination (
+            id VARCHAR PRIMARY KEY,
+            category VARCHAR NOT NULL
+        )"
+    )
+    .execute(&pool)
+    .await?;
+
+    // Insert test data
+    for i in 1..=10 {
+        sqlx::query("INSERT INTO test_pagination (id, category) VALUES ($1, $2)")
+            .bind(format!("item{}", i))
+            .bind(if i <= 5 { "A" } else { "B" })
+            .execute(&pool)
+            .await?;
+    }
+
+    // Test fetch_all with LIMIT
+    let results: Vec<(String, i64)> = TestPagination::agg_query()
+        .group_by("category")
+        .count()
+        .order_by("category", "DESC")
+        .limit(1)
+        .fetch_all(&pool)
+        .await?;
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "B");  // Should get category B first (DESC order)
+
+    // Test fetch_all with OFFSET
+    let results: Vec<(String, i64)> = TestPagination::agg_query()
+        .group_by("category")
+        .count()
+        .order_by("category", "ASC")
+        .limit(1)
+        .offset(1)
+        .fetch_all(&pool)
+        .await?;
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "B");  // Should skip A and get B
+
+    // Cleanup
+    sqlx::query("DROP TABLE test_pagination")
+        .execute(&pool)
+        .await?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Test Models for Integration Tests
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, FromRow, EnhancedCrud)]
+struct TestUsersCount {
+    id: String,
+    role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow, EnhancedCrud)]
+struct TestRating {
+    id: String,
+    engineer_id: String,
+    score: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow, EnhancedCrud)]
+struct TestOrderStatus {
+    id: String,
+    status: String,
+    amount: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow, EnhancedCrud)]
+struct TestItem {
+    id: String,
+    value: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow, EnhancedCrud)]
+struct TestScore {
+    id: String,
+    score: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow, EnhancedCrud)]
+struct TestAmount {
+    id: String,
+    amount: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, FromRow, EnhancedCrud)]
+struct TestPagination {
+    id: String,
+    category: String,
 }
 

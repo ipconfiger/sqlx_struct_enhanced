@@ -643,6 +643,180 @@ let sql2 = Order::agg_query()
 assert_eq!(sql1, sql2);
 ```
 
+### Direct Execution Methods
+
+For cleaner code, you can execute aggregation queries directly without manually calling `build()` and `sqlx::query_as()`:
+
+#### Specialized Methods (Recommended)
+
+For common aggregation types, use specialized methods that return simple types:
+
+```rust
+// COUNT - Returns i64 directly
+let count: i64 = User::agg_query()
+    .where_("role = {}", &[&"admin"])
+    .count()
+    .fetch_count(&pool)
+    .await?;
+
+// AVG - Returns Option<f64> (NULL if no rows)
+let average_score: Option<f64> = Rating::agg_query()
+    .where_("category = {}", &[&"tech"])
+    .avg("score")
+    .fetch_avg(&pool)
+    .await?;
+
+// SUM - Returns Option<f64> (NULL if no rows)
+let total_amount: Option<f64> = Order::agg_query()
+    .where_("status = {}", &[&"completed"])
+    .sum("amount")
+    .fetch_sum(&pool)
+    .await?;
+```
+
+**Benefits:**
+- No manual type specification needed
+- Cleaner, more readable code
+- Automatic parameter binding
+- Consistent with CRUD operations
+
+#### Generic Methods
+
+For flexible result types, use generic methods:
+
+```rust
+// fetch_one<T>() - Single row result
+let (avg, count): (Option<f64>, i64) = Rating::agg_query()
+    .where_("product_id = {}", &[&"prod123"])
+    .avg("score")
+    .count()
+    .fetch_one(&pool)
+    .await?;
+
+// fetch_all<T>() - Multiple row results (GROUP BY)
+let results: Vec<(String, i64)> = Order::agg_query()
+    .group_by("status")
+    .count()
+    .fetch_all(&pool)
+    .await?;
+
+// fetch_optional<T>() - Optional result (None if no rows)
+let max_value: Option<(i32,)> = Metric::agg_query()
+    .where_("sensor_id = {}", &[&"sensor1"])
+    .max("value")
+    .fetch_optional(&pool)
+    .await?;
+```
+
+**When to use:**
+- Multiple aggregates in one query (AVG + COUNT, etc.)
+- GROUP BY queries with custom result types
+- Queries that might return zero rows
+
+#### Code Comparison
+
+**Old way (using build()):**
+```rust
+// 8 lines, manual parameter binding
+let id_str = id.to_string();
+let sql = User::agg_query()
+    .where_("operation_center_id = {}", &[&id_str])
+    .count()
+    .build();
+let (count,) = sqlx::query_as::<_, (i64,)>(sql)
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+```
+
+**New way (using fetch_count()):**
+```rust
+// 2 lines, automatic binding
+let count = User::agg_query()
+    .where_("operation_center_id = {}", &[&id])
+    .count()
+    .fetch_count(&pool)
+    .await?;
+```
+
+**Reduction: 75% less code!**
+
+#### Available Methods
+
+**Specialized Methods:**
+- `.fetch_count(&pool)` → Returns `Result<i64>`
+- `.fetch_avg(&pool)` → Returns `Result<Option<f64>>`
+- `.fetch_sum(&pool)` → Returns `Result<Option<f64>>`
+
+**Generic Methods:**
+- `.fetch_one<T>(&pool)` → Returns `Result<T>` (single row)
+- `.fetch_all<T>(&pool)` → Returns `Result<Vec<T>>` (multiple rows)
+- `.fetch_optional<T>(&pool)` → Returns `Result<Option<T>>` (0 or 1 rows)
+
+All methods automatically handle:
+- WHERE clause parameters
+- HAVING clause parameters
+- LIMIT parameter
+- OFFSET parameter
+
+#### Complete Examples
+
+```rust
+use sqlx_struct_enhanced::EnhancedCrud;
+
+#[derive(EnhancedCrud)]
+struct Order {
+    id: String,
+    customer_id: String,
+    amount: f64,
+    status: String,
+}
+
+// Example 1: Simple count with specialized method
+let active_order_count = Order::agg_query()
+    .where_("status = {}", &[&"active"])
+    .count()
+    .fetch_count(&pool)
+    .await?;
+
+// Example 2: AVG + COUNT with generic method
+let (avg_amount, order_count): (Option<f64>, i64) = Order::agg_query()
+    .where_("customer_id = {}", &[&"cust123"])
+    .avg("amount")
+    .count()
+    .fetch_one(&pool)
+    .await?;
+
+// Example 3: GROUP BY with fetch_all
+let status_counts: Vec<(String, i64)> = Order::agg_query()
+    .group_by("status")
+    .count()
+    .order_by("count", "DESC")
+    .fetch_all(&pool)
+    .await?;
+
+// Example 4: Pagination with LIMIT/OFFSET
+let page_results: Vec<(String, Option<f64>)> = Order::agg_query()
+    .group_by("customer_id")
+    .avg("amount")
+    .order_by("avg", "DESC")
+    .limit(10)
+    .offset(20)
+    .fetch_all(&pool)
+    .await?;
+
+// Example 5: Complex query with all features
+let results: Vec<(String, i64)> = Order::agg_query()
+    .where_("status = {} AND amount > {}", &["completed", "100"])
+    .group_by("customer_id")
+    .count()
+    .having("count > {}", &[&5i64])
+    .order_by("count", "DESC")
+    .limit(10)
+    .fetch_all(&pool)
+    .await?;
+```
+
 ### JOIN Support
 
 Combine data from multiple tables for complex analytics:
