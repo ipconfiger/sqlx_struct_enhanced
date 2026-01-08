@@ -23,7 +23,7 @@ all-types = ["decimal", "chrono", "json", "uuid"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio", "tls-rustls", "all-databases", "uuid", "chrono"], optional = true}
+sqlx = { version = "0.7.3", default-features = false, optional = true }
 sqlx_struct_macros = { version = "*", path = "sqlx_struct_macros", default-features = false }
 tokio = {version = "1.26.0", features = ["full"]}
 uuid = { version = "1.10.0", features = ["v4", "fast-rng"], optional = true }
@@ -34,7 +34,6 @@ futures = "0.3"
 rust_decimal = { version = "1.32", optional = true }
 
 [dev-dependencies]
-sqlx = { version = "0.7.3", features = ["runtime-tokio", "tls-rustls", "postgres"] }
-sqlx_struct_enhanced =  { version = "*", path = ".", features = ["postgres"] }
+sqlx_struct_enhanced =  { version = "*", path = ".", default-features = false }
 tokio-test = "0.4.2"
 serial_test = "3.0"

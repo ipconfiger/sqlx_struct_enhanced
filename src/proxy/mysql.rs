@@ -117,7 +117,7 @@ where
 
 impl<'q, O> EnhancedQuery<'q, MySql, O> for EnhancedQueryAsMySql<'q, O>
 where
-    O: Send + Unpin + for<'r> sqlx::FromRow<'r, MySqlRow> + sqlx::Decode<'q, MySql> + sqlx::Type<MySql>,
+    O: Send + Unpin + for<'r> sqlx::FromRow<'r, MySqlRow>,
 {
     fn from_query_as(inner: QueryAs<'q, MySql, O, <MySql as HasArguments<'q>>::Arguments>) -> Self {
         Self { inner }

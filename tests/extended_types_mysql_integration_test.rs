@@ -1,35 +1,33 @@
-// Integration test for extended BindProxy data types
+// Integration test for extended BindProxy data types - MySQL
 //
-// This test verifies that:
-// 1. Additional numeric types (i8, i16, f32) work correctly
-// 2. Unsigned integers (u8, u16, u32, u64) convert to String
-// 3. Binary types (Vec<u8>, &[u8]) work correctly
-// 4. Chrono date/time types convert to ISO 8601 strings
-// 5. UUID types work correctly
-// 6. JSON types work correctly
-// 7. bind_proxy method works for all types
+// This test verifies that all extended types work correctly with MySQL
 
-#[cfg(all(feature = "postgres", feature = "all-types"))]
+#[cfg(feature = "mysql")]
 #[cfg(test)]
-mod extended_types_integration_tests {
-    use sqlx::{FromRow, PgPool, Postgres};
-    use sqlx::query::{Query, QueryAs};
-    use sqlx::database::HasArguments;
-    use sqlx_struct_enhanced::{EnhancedCrud, EnhancedCrudExt, EnhancedQuery, Scheme};
+mod extended_types_mysql_integration_tests {
+    use sqlx::{FromRow, MySqlPool};
+    use sqlx_struct_enhanced::{EnhancedCrud, EnhancedCrudExt, EnhancedQuery};
     use serial_test::serial;
     use chrono::{NaiveDate, NaiveTime, NaiveDateTime, Utc, TimeZone};
 
     // Helper function to get database connection
-    async fn get_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:@127.0.0.1/test-sqlx-tokio".to_string());
+    async fn get_test_pool() -> MySqlPool {
+        let database_url = std::env::var("MYSQL_DATABASE_URL")
+            .unwrap_or_else(|_| "mysql://root:test@127.0.0.1:3306/test_sqlx".to_string());
 
-        sqlx::PgPool::connect(&database_url).await
-            .expect("Failed to connect to test database")
+        // Wait a bit for MySQL to be ready
+        for _ in 0..10 {
+            match sqlx::MySqlPool::connect(&database_url).await {
+                Ok(pool) => return pool,
+                Err(_) => tokio::time::sleep(tokio::time::Duration::from_millis(500)).await,
+            }
+        }
+
+        panic!("Failed to connect to MySQL test database after multiple attempts");
     }
 
     // Helper function to create test table with all supported types
-    async fn create_extended_types_table(pool: &PgPool) {
+    async fn create_extended_types_table(pool: &MySqlPool) {
         let drop_query = "DROP TABLE IF EXISTS extended_types_test";
         sqlx::query(drop_query).execute(pool).await
             .expect("Failed to drop existing table");
@@ -41,7 +39,7 @@ mod extended_types_integration_tests {
                 -- Numeric types
                 tiny_int SMALLINT,
                 small_int SMALLINT,
-                float_val REAL,
+                float_val FLOAT,
 
                 -- Unsigned integers (stored as TEXT)
                 tiny_uint TEXT,
@@ -56,7 +54,7 @@ mod extended_types_integration_tests {
                 timestamp TEXT,
 
                 -- Binary
-                data BYTEA,
+                data LONGBLOB,
 
                 -- UUID (stored as TEXT)
                 parent_id TEXT,
@@ -112,8 +110,8 @@ mod extended_types_integration_tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_extended_types_insert_select_numeric() {
-        println!("🔧 Starting test_extended_types_insert_select_numeric...");
+    async fn test_mysql_extended_types_insert_select_numeric() {
+        println!("🔧 Starting test_mysql_extended_types_insert_select_numeric...");
         let pool = get_test_pool().await;
         create_extended_types_table(&pool).await;
         println!("✅ Table created");
@@ -146,7 +144,7 @@ mod extended_types_integration_tests {
         println!("✅ Inserted record");
 
         // Select using bind_proxy
-        let selected = ExtendedTypesTest::where_query_ext("id = {}")
+        let selected = ExtendedTypesTest::where_query_ext("id = ?")
             .bind_proxy("test-numeric-1")
             .fetch_optional(&pool)
             .await
@@ -174,8 +172,8 @@ mod extended_types_integration_tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_extended_types_chrono_datetime() {
-        println!("🔧 Starting test_extended_types_chrono_datetime...");
+    async fn test_mysql_extended_types_chrono_datetime() {
+        println!("🔧 Starting test_mysql_extended_types_chrono_datetime...");
         let pool = get_test_pool().await;
         create_extended_types_table(&pool).await;
 
@@ -208,7 +206,7 @@ mod extended_types_integration_tests {
             .expect("Failed to insert record");
 
         // Test using bind_proxy with chrono types
-        let selected = ExtendedTypesTest::where_query_ext("id = {}")
+        let selected = ExtendedTypesTest::where_query_ext("id = ?")
             .bind_proxy("test-datetime-1")
             .fetch_one(&pool)
             .await
@@ -235,8 +233,8 @@ mod extended_types_integration_tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_extended_types_binary() {
-        println!("🔧 Starting test_extended_types_binary...");
+    async fn test_mysql_extended_types_binary() {
+        println!("🔧 Starting test_mysql_extended_types_binary...");
         let pool = get_test_pool().await;
         create_extended_types_table(&pool).await;
 
@@ -263,7 +261,7 @@ mod extended_types_integration_tests {
         record.insert_bind().execute(&pool).await
             .expect("Failed to insert record");
 
-        let selected = ExtendedTypesTest::where_query_ext("id = {}")
+        let selected = ExtendedTypesTest::where_query_ext("id = ?")
             .bind_proxy("test-binary-1")
             .fetch_one(&pool)
             .await
@@ -282,8 +280,8 @@ mod extended_types_integration_tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_extended_types_uuid() {
-        println!("🔧 Starting test_extended_types_uuid...");
+    async fn test_mysql_extended_types_uuid() {
+        println!("🔧 Starting test_mysql_extended_types_uuid...");
         let pool = get_test_pool().await;
         create_extended_types_table(&pool).await;
 
@@ -313,7 +311,7 @@ mod extended_types_integration_tests {
             .expect("Failed to insert record");
 
         // Query using bind_proxy with UUID
-        let selected = ExtendedTypesTest::where_query_ext("id = {}")
+        let selected = ExtendedTypesTest::where_query_ext("id = ?")
             .bind_proxy("test-uuid-1")
             .fetch_one(&pool)
             .await
@@ -331,8 +329,8 @@ mod extended_types_integration_tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_extended_types_json() {
-        println!("🔧 Starting test_extended_types_json...");
+    async fn test_mysql_extended_types_json() {
+        println!("🔧 Starting test_mysql_extended_types_json...");
         let pool = get_test_pool().await;
         create_extended_types_table(&pool).await;
 
@@ -365,7 +363,7 @@ mod extended_types_integration_tests {
         record.insert_bind().execute(&pool).await
             .expect("Failed to insert record");
 
-        let selected = ExtendedTypesTest::where_query_ext("id = {}")
+        let selected = ExtendedTypesTest::where_query_ext("id = ?")
             .bind_proxy("test-json-1")
             .fetch_one(&pool)
             .await
@@ -385,8 +383,8 @@ mod extended_types_integration_tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_extended_types_complex_where() {
-        println!("🔧 Starting test_extended_types_complex_where...");
+    async fn test_mysql_extended_types_complex_where() {
+        println!("🔧 Starting test_mysql_extended_types_complex_where...");
         let pool = get_test_pool().await;
         create_extended_types_table(&pool).await;
 
@@ -414,7 +412,7 @@ mod extended_types_integration_tests {
         }
 
         // Query using bind_proxy with multiple types
-        let results = ExtendedTypesTest::where_query_ext("tiny_int >= {} AND small_int > {}")
+        let results = ExtendedTypesTest::where_query_ext("tiny_int >= ? AND small_int > ?")
             .bind_proxy(3i16)
             .bind_proxy(1002i16)
             .fetch_all(&pool)
@@ -424,7 +422,7 @@ mod extended_types_integration_tests {
         assert_eq!(results.len(), 2); // Records with tiny_int >= 3
 
         // Test with f32
-        let results = ExtendedTypesTest::where_query_ext("float_val BETWEEN {} AND {}")
+        let results = ExtendedTypesTest::where_query_ext("float_val BETWEEN ? AND ?")
             .bind_proxy(2.0f32)
             .bind_proxy(4.0f32)
             .fetch_all(&pool)
@@ -442,8 +440,8 @@ mod extended_types_integration_tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_extended_types_unsigned_where() {
-        println!("🔧 Starting test_extended_types_unsigned_where...");
+    async fn test_mysql_extended_types_unsigned_where() {
+        println!("🔧 Starting test_mysql_extended_types_unsigned_where...");
         let pool = get_test_pool().await;
         create_extended_types_table(&pool).await;
 
@@ -469,7 +467,7 @@ mod extended_types_integration_tests {
             .expect("Failed to insert record");
 
         // Query using bind_proxy with unsigned integers (converts to String)
-        let selected = ExtendedTypesTest::where_query_ext("tiny_uint = {}")
+        let selected = ExtendedTypesTest::where_query_ext("tiny_uint = ?")
             .bind_proxy(255u8)
             .fetch_optional(&pool)
             .await
@@ -478,7 +476,7 @@ mod extended_types_integration_tests {
         assert!(selected.is_some());
 
         // Test with u16
-        let selected = ExtendedTypesTest::where_query_ext("small_uint = {}")
+        let selected = ExtendedTypesTest::where_query_ext("small_uint = ?")
             .bind_proxy(65535u16)
             .fetch_optional(&pool)
             .await
@@ -487,7 +485,7 @@ mod extended_types_integration_tests {
         assert!(selected.is_some());
 
         // Test with u32
-        let selected = ExtendedTypesTest::where_query_ext("medium_uint = {}")
+        let selected = ExtendedTypesTest::where_query_ext("medium_uint = ?")
             .bind_proxy(4294967295u32)
             .fetch_optional(&pool)
             .await

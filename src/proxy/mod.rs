@@ -7,6 +7,8 @@
 
 mod bind;
 mod r#trait;
+
+#[cfg(feature = "postgres")]
 mod postgres;
 
 #[cfg(feature = "postgres")]

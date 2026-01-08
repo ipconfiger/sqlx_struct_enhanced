@@ -1,0 +1,21 @@
+[workspace]
+# This creates a standalone workspace to avoid inheriting parent workspace features
+
+[package]
+name = "mysql_integration_test_binary"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "mysql_integration_test"
+path = "mysql_test.rs"
+
+[dependencies]
+# Explicitly enable mysql feature for sqlx
+sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio-rustls", "json", "mysql", "macros"] }
+sqlx_struct_enhanced = { path = "..", default-features = false, features = ["mysql", "all-types"] }
+tokio = { version = "1.26.0", features = ["full"] }
+chrono = "0.4"
+serde_json = "1.0"
+uuid = { version = "1.10.0", features = ["v4", "fast-rng"] }

@@ -2,7 +2,16 @@ pub mod traits;
 pub mod proxy;
 pub use sqlx_struct_macros::EnhancedCrud;
 pub use traits::{EnhancedCrud, EnhancedCrudExt};
-pub use proxy::{EnhancedQueryAsPostgres, BindProxy, BindValue};
+
+#[cfg(feature = "postgres")]
+pub use proxy::{EnhancedQueryAsPostgres, EnhancedQuery, BindProxy, BindValue};
+
+#[cfg(all(feature = "mysql", not(feature = "postgres")))]
+pub use proxy::{EnhancedQueryAsMySql, EnhancedQuery, BindProxy, BindValue};
+
+#[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+pub use proxy::{EnhancedQueryAsSqlite, EnhancedQuery, BindProxy, BindValue};
+
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Mutex;

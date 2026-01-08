@@ -117,7 +117,7 @@ where
 
 impl<'q, O> EnhancedQuery<'q, Postgres, O> for EnhancedQueryAsPostgres<'q, O>
 where
-    O: Send + Unpin + for<'r> sqlx::FromRow<'r, PgRow> + sqlx::Decode<'q, Postgres> + sqlx::Type<Postgres>,
+    O: Send + Unpin + for<'r> sqlx::FromRow<'r, PgRow>,
 {
     fn from_query_as(inner: QueryAs<'q, Postgres, O, <Postgres as HasArguments<'q>>::Arguments>) -> Self {
         Self { inner }
