@@ -4,6 +4,7 @@
 use sqlx_struct_enhanced::{EnhancedCrud, Scheme, AggQueryBuilder, Join, JoinType};
 use sqlx::{FromRow, Postgres, query::Query, query::QueryAs};
 use sqlx::database::HasArguments;
+use sqlx::Row;
 
 // Test struct with foreign key relationship
 #[derive(Debug, Clone, PartialEq, FromRow, EnhancedCrud)]

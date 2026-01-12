@@ -10,16 +10,18 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["postgres"]
-postgres = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/postgres", "sqlx_struct_macros/postgres", "uuid"]
-mysql = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/mysql", "sqlx_struct_macros/mysql", "uuid"]
-sqlite = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/sqlite", "sqlx_struct_macros/sqlite", "uuid"]
+default = ["postgres", "chrono"]
+postgres = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/postgres", "sqlx/chrono", "sqlx_struct_macros/postgres", "uuid"]
+mysql = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/mysql", "sqlx/chrono", "sqlx_struct_macros/mysql", "uuid"]
+mysql_5_7 = ["mysql", "sqlx_struct_macros/mysql_5_7"]  # MySQL 5.7 compatibility (no INCLUDE support)
+sqlite = ["sqlx/runtime-tokio-rustls", "sqlx/json", "sqlx/sqlite", "sqlx/chrono", "sqlx_struct_macros/sqlite", "uuid"]
 decimal = ["rust_decimal"]
-chrono = ["dep:chrono"]
+chrono = ["dep:chrono", "postgres"]
 json = ["dep:serde_json"]
 uuid = ["dep:uuid"]
 all-types = ["decimal", "chrono", "json", "uuid"]
 join_queries = ["sqlx_struct_macros/join_queries"]
+log_sql = ["sqlx_struct_macros/log_sql"]  # Enable SQL logging for debugging
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -35,7 +37,11 @@ futures = "0.3"
 rust_decimal = { version = "1.32", optional = true }
 
 [dev-dependencies]
-sqlx_struct_enhanced =  { version = "*", path = ".", default-features = false, features = ["postgres", "uuid"] }
-sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "uuid", "migrate"] }
+sqlx_struct_enhanced =  { version = "*", path = ".", default-features = false, features = ["postgres", "uuid", "join_queries", "chrono", "decimal", "json"] }
+sqlx = { version = "0.7.3", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "uuid", "migrate", "chrono"] }
 tokio-test = "0.4.2"
 serial_test = "3.0"
+rust_decimal = "1.32"
+chrono = "0.4"
+syn = { version = "1.0", features = ["full"] }
+serde_json = "1.0"

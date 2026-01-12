@@ -5,6 +5,7 @@ use sqlx::database::HasArguments;
 use sqlx::postgres::Postgres;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::FromRow;
+use sqlx::Row;
 use serial_test::serial;
 
 

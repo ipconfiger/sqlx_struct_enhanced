@@ -1,7 +1,7 @@
 // Test without cast_as to isolate the issue
 #[cfg(test)]
 mod no_cast_tests {
-    use sqlx::{FromRow, PgPool};
+    use sqlx::{FromRow, PgPool, Row};
     use sqlx::query::{Query, QueryAs};
     use sqlx::database::HasArguments;
     use sqlx::postgres::Postgres;

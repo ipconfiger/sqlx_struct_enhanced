@@ -8,6 +8,7 @@
 use sqlx_struct_enhanced::{EnhancedCrud, Scheme};
 use sqlx::{FromRow, PgPool, Postgres, query::Query, query::QueryAs};
 use sqlx::database::HasArguments;
+use sqlx::Row;
 
 // ========================================================================
 // Domain Models

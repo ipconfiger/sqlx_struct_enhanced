@@ -2,9 +2,16 @@ pub mod traits;
 pub mod proxy;
 pub mod decimal_helpers;
 pub mod aggregate;
+pub mod join;
+
+// Migration module is currently PostgreSQL-only
+#[cfg(feature = "postgres")]
+pub mod migration;
+
 pub use sqlx_struct_macros::EnhancedCrud;
 pub use traits::{EnhancedCrud, EnhancedCrudExt};
 pub use aggregate::{AggQueryBuilder, Join, JoinType};
+pub use join::{JoinQueryBuilder, JoinType as JoinQueryType, JoinClause, SchemeAccessor};
 
 #[cfg(feature = "postgres")]
 pub use proxy::{EnhancedQueryAsPostgres, EnhancedQuery, BindProxy, BindValue};
@@ -297,7 +304,7 @@ fn param_trans(p: String) -> String {
 /// // PostgreSQL: "name = $1 AND age = $2"
 /// // MySQL/SQLite: "name = ? AND age = ?"
 /// ```
-fn prepare_where(w: &str, field_count: i32) -> String {
+pub fn prepare_where(w: &str, field_count: i32) -> String {
     let param_count = w.matches("{}").count() as i32;
     let mut where_sql = w.to_string();
 
@@ -322,15 +329,29 @@ fn prepare_where(w: &str, field_count: i32) -> String {
 /// ColumnDefinition {
 ///     name: "price".to_string(),
 ///     cast_as: Some("TEXT".to_string()),
+///     is_decimal: false,
 /// }
 /// ```
 /// This will generate: `price::TEXT as price` in SELECT queries.
+///
+/// For DECIMAL fields (Rust String → DB NUMERIC), `is_decimal=true` indicates
+/// the field needs ::numeric cast in INSERT/UPDATE statements.
+///
+/// For UUID fields (Rust String → DB UUID), `is_uuid=true` indicates
+/// the field needs ::uuid cast in WHERE IN clauses for type inference.
 #[derive(Debug, Clone)]
 pub struct ColumnDefinition {
     /// Column name
     pub name: String,
-    /// Optional type cast (e.g., "TEXT" for NUMERIC→TEXT conversion)
+    /// Optional type cast for SELECT statements (e.g., "TEXT" for NUMERIC→TEXT conversion)
+    /// This controls how values are CAST when reading FROM the database.
     pub cast_as: Option<String>,
+    /// Whether this is a DECIMAL field (Rust String type bound to NUMERIC column)
+    /// When true, INSERT/UPDATE statements add ::numeric cast for type inference.
+    pub is_decimal: bool,
+    /// Whether this is a UUID field (Rust String type bound to UUID column)
+    /// When true, bulk operations add ::uuid cast for type inference.
+    pub is_uuid: bool,
 }
 
 
@@ -364,7 +385,7 @@ static SQL_CACHE: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new
 /// The returned reference is valid for the entire program duration because
 /// it points to a string stored in a global static HashMap. The HashMap is
 /// never cleared, so the reference will remain valid.
-fn get_or_insert_sql(key: String, gen_fn: impl FnOnce() -> String) -> &'static str {
+pub fn get_or_insert_sql(key: String, gen_fn: impl FnOnce() -> String) -> &'static str {
     let mut cache = SQL_CACHE.lock().unwrap();
     if !cache.contains_key(&key) {
         cache.insert(key.clone(), gen_fn());
@@ -378,6 +399,31 @@ fn get_or_insert_sql(key: String, gen_fn: impl FnOnce() -> String) -> &'static s
 }
 
 impl Scheme {
+    /// Returns the table name.
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// Returns the column definitions.
+    pub fn column_definitions(&self) -> &[ColumnDefinition] {
+        &self.column_definitions
+    }
+
+    /// Returns the ID field name.
+    pub fn id_field(&self) -> &str {
+        &self.id_field
+    }
+
+    /// Returns the insert fields.
+    pub fn insert_fields(&self) -> &[String] {
+        &self.insert_fields
+    }
+
+    /// Returns the update fields.
+    pub fn update_fields(&self) -> &[String] {
+        &self.update_fields
+    }
+
     /// Generates a SELECT clause with explicit column list and optional type casting.
     ///
     /// This method replaces `SELECT *` with an explicit column list, applying
@@ -403,16 +449,24 @@ impl Scheme {
                 return "*".to_string();
             }
 
-            // Generate explicit column list with optional casting
+            // Generate explicit column list with optional casting and identifier quoting
+            let db = get_db();
             self.column_definitions.iter()
                 .map(|col| {
+                    let quoted_name = db.quote_identifier(&col.name);
                     match &col.cast_as {
                         Some(cast_type) => {
-                            // PostgreSQL: column::TYPE as column
-                            // Example: commission_rate::TEXT as commission_rate
-                            format!("{}::{} as {}", col.name, cast_type, col.name)
+                            // PostgreSQL: "column"::TYPE as "column"
+                            // Example: "commission_rate"::TEXT as "commission_rate"
+                            // MySQL/SQLite: don't support cast syntax, use quoted column name only
+                            match db {
+                                DbType::PostgreSQL => {
+                                    format!("{}::{} as {}", quoted_name, cast_type, quoted_name)
+                                }
+                                DbType::MySQL | DbType::SQLite => quoted_name,
+                            }
                         }
-                        None => col.name.clone(),
+                        None => quoted_name,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -426,23 +480,54 @@ impl Scheme {
     pub fn gen_count_sql_static(&self, where_stmt: &str) -> &'static str {
         let key = format!("{}-count-{}", self.table_name, where_stmt);
         get_or_insert_sql(key, || {
+            let quoted_table = get_db().quote_identifier(&self.table_name);
             let where_sql = prepare_where(where_stmt, 1);
-            format!("SELECT COUNT(*) FROM {} WHERE {}", self.table_name, where_sql)
+            format!("SELECT COUNT(*) FROM {} WHERE {}", quoted_table, where_sql)
         })
     }
 
     /// Generates an INSERT query for all fields.
     ///
     /// Returns a cached `&'static str` for efficient reuse.
+    /// For DECIMAL fields (identified by `is_decimal=true`), adds ::numeric cast to help SQLx
+    /// with type inference (e.g., $1::numeric for DECIMAL fields stored as String).
+    ///
+    /// IMPORTANT: The ::numeric cast is applied to DECIMAL fields (Rust String → DB NUMERIC)
+    /// to help SQLx with type inference. The `is_decimal` flag is set by #[crud(decimal(...))] attribute.
     pub fn gen_insert_sql_static(&self) -> &'static str {
         let key = format!("{}-insert", self.table_name);
         get_or_insert_sql(key, || {
-            let params: Vec<String> = self.insert_fields.iter().enumerate().map(|(idx, _)|{
+            let params: Vec<String> = self.insert_fields.iter().enumerate().map(|(idx, field_name)|{
                 let p = format!("${}", idx + 1);
+                // Find the column definition for this field
+                let col_def = self.column_definitions.iter()
+                    .find(|col| col.name == *field_name);
+                // Add ::numeric cast for DECIMAL fields (is_decimal=true indicates DECIMAL stored as String)
+                // This cast helps SQLx with type inference when String values need to be inserted into NUMERIC columns
+                if let Some(col) = col_def {
+                    if col.is_decimal {
+                        eprintln!(
+                            "[SQLxEnhanced] Adding ::numeric cast for field '{}' at position {} in table '{}'",
+                            field_name, idx + 1, self.table_name
+                        );
+                        return format!("{}::numeric", param_trans(p));
+                    }
+                }
                 param_trans(p)
             }).collect();
             let params_str = params.join(",");
-            format!(r#"INSERT INTO {} VALUES ({})"#, self.table_name, params_str)
+
+            // Generate explicit column list to avoid dependency on database table column order
+            let db = get_db();
+            let columns: Vec<String> = self.insert_fields.iter()
+                .map(|field_name| db.quote_identifier(field_name))
+                .collect();
+            let columns_str = columns.join(",");
+
+            let quoted_table = get_db().quote_identifier(&self.table_name);
+            let sql = format!(r#"INSERT INTO {} ({}) VALUES ({})"#, quoted_table, columns_str, params_str);
+            eprintln!("[SQLxEnhanced] Generated INSERT SQL for table '{}': {}", self.table_name, sql);
+            sql
         })
     }
 
@@ -458,15 +543,30 @@ impl Scheme {
             let mut param_index = 1;
 
             for _ in 0..row_count {
-                let row_params: Vec<String> = (0..field_count).map(|_| {
+                let row_params: Vec<String> = (0..field_count).map(|field_idx| {
                     let p = format!("${}", param_index);
                     param_index += 1;
-                    param_trans(p)
+                    let param = param_trans(p);
+
+                    // Find the column definition for this field
+                    let field_name = &self.insert_fields[field_idx];
+                    let col_def = self.column_definitions.iter()
+                        .find(|col| col.name == *field_name);
+
+                    // Add ::numeric cast for DECIMAL fields (is_decimal=true indicates DECIMAL stored as String)
+                    if let Some(col) = col_def {
+                        if col.is_decimal {
+                            return format!("{}::numeric", param);
+                        }
+                    }
+
+                    param
                 }).collect();
                 all_params.push(format!("({})", row_params.join(",")));
             }
 
-            format!(r#"INSERT INTO {} VALUES {}"#, self.table_name, all_params.join(","))
+            let quoted_table = get_db().quote_identifier(&self.table_name);
+            format!(r#"INSERT INTO {} VALUES {}"#, quoted_table, all_params.join(","))
         })
     }
 
@@ -477,20 +577,41 @@ impl Scheme {
     pub fn gen_bulk_update_sql_static(&self, row_count: usize) -> &'static str {
         let key = format!("{}-bulk-update-{}-rows", self.table_name, row_count);
         get_or_insert_sql(key, || {
+            let db = get_db();
+            let quoted_table = db.quote_identifier(&self.table_name);
+            let quoted_id_field = db.quote_identifier(&self.id_field);
             let mut param_index = 1;
             let mut set_clauses = Vec::new();
 
             // Generate CASE WHEN for each update field
             for field in &self.update_fields {
+                let quoted_field = db.quote_identifier(field);
+
+                // Find the column definition for this field
+                let col_def = self.column_definitions.iter()
+                    .find(|col| col.name == *field);
+
+                // Check if this is a DECIMAL field
+                let is_decimal = col_def
+                    .map_or(false, |col| col.is_decimal);
+
                 let when_clauses: Vec<String> = (0..row_count).map(|_| {
                     let id_param = param_trans(format!("${}", param_index));
                     param_index += 1;
                     let val_param = param_trans(format!("${}", param_index));
                     param_index += 1;
-                    format!("WHEN {} THEN {}", id_param, val_param)
+
+                    // Add ::numeric cast for DECIMAL fields
+                    let val_param_with_cast = if is_decimal {
+                        format!("{}::numeric", val_param)
+                    } else {
+                        val_param
+                    };
+
+                    format!("WHEN {} THEN {}", id_param, val_param_with_cast)
                 }).collect();
 
-                let case_expr = format!("{}=CASE {} {} END", field, self.id_field, when_clauses.join(" "));
+                let case_expr = format!("{}=CASE {} {} END", quoted_field, quoted_id_field, when_clauses.join(" "));
                 set_clauses.push(case_expr);
             }
 
@@ -502,9 +623,9 @@ impl Scheme {
             }).collect();
 
             format!(r#"UPDATE {} SET {} WHERE {} IN ({})"#,
-                self.table_name,
+                quoted_table,
                 set_clauses.join(","),
-                self.id_field,
+                quoted_id_field,
                 id_params.join(",")
             )
         })
@@ -516,13 +637,46 @@ impl Scheme {
     pub fn gen_update_by_id_sql_static(&self) -> &'static str {
         let key = format!("{}-update-by-id", self.table_name);
         get_or_insert_sql(key, || {
+            let db = get_db();
+            let quoted_table = db.quote_identifier(&self.table_name);
+            let quoted_id_field = db.quote_identifier(&self.id_field);
             let set_seq: Vec<String> = self.update_fields.iter().enumerate().map(|(idx, fd)|{
+                let quoted_field = db.quote_identifier(fd);
                 let p = format!("${}", idx + 1);
                 let p = param_trans(p);
-                format!("{}={}", fd, p)
+                // Find the column definition for this field
+                let col_def = self.column_definitions.iter()
+                    .find(|col| col.name == *fd);
+                // Add ::numeric cast for DECIMAL fields (is_decimal=true indicates DECIMAL stored as String)
+                let param_with_cast = if let Some(col) = col_def {
+                    if col.is_decimal {
+                        format!("{}::numeric", p)
+                    } else {
+                        p
+                    }
+                } else {
+                    p
+                };
+                format!("{}={}", quoted_field, param_with_cast)
             }).collect();
-            let id_param = param_trans(format!("${}", self.insert_fields.len() as i32));
-            format!(r#"UPDATE {} SET {} WHERE {}={}"#, self.table_name, set_seq.join(","), self.id_field, id_param)
+
+            // Check if ID field is a DECIMAL field
+            let id_col_def = self.column_definitions.iter()
+                .find(|col| col.name == self.id_field);
+            let id_param_base = format!("${}", self.update_fields.len() + 1);
+            let id_param = param_trans(id_param_base);
+            // Add ::numeric cast for DECIMAL ID fields
+            let id_param_with_cast = if let Some(col) = id_col_def {
+                if col.is_decimal {
+                    format!("{}::numeric", id_param)
+                } else {
+                    id_param
+                }
+            } else {
+                id_param
+            };
+
+            format!(r#"UPDATE {} SET {} WHERE {}={}"#, quoted_table, set_seq.join(","), quoted_id_field, id_param_with_cast)
         })
     }
 
@@ -532,13 +686,16 @@ impl Scheme {
     pub fn gen_update_where_sql_static(&self, where_stmt: &str) -> &'static str {
         let key = format!("{}-update-where-{}", self.table_name, where_stmt);
         get_or_insert_sql(key, || {
+            let db = get_db();
+            let quoted_table = db.quote_identifier(&self.table_name);
             let set_seq: Vec<String> = self.update_fields.iter().enumerate().map(|(idx, fd)|{
+                let quoted_field = db.quote_identifier(fd);
                 let p = format!("${}", idx + 1);
                 let p = param_trans(p);
-                format!("{}={}", fd, p)
+                format!("{}={}", quoted_field, p)
             }).collect();
             let where_sql = prepare_where(where_stmt, self.insert_fields.len() as i32);
-            format!(r#"UPDATE {} SET {} WHERE {}"#, self.table_name, set_seq.join(","), where_sql)
+            format!(r#"UPDATE {} SET {} WHERE {}"#, quoted_table, set_seq.join(","), where_sql)
         })
     }
 
@@ -548,8 +705,26 @@ impl Scheme {
     pub fn gen_delete_sql_static(&self) -> &'static str {
         let key = format!("{}-delete-by-id", self.table_name);
         get_or_insert_sql(key, || {
+            let db = get_db();
+            let quoted_table = db.quote_identifier(&self.table_name);
+            let quoted_id_field = db.quote_identifier(&self.id_field);
+
+            // Check if ID field is a DECIMAL field
+            let id_col_def = self.column_definitions.iter()
+                .find(|col| col.name == self.id_field);
             let id_param = param_trans("$1".to_string());
-            format!(r#"DELETE FROM {} WHERE {}={}"#, self.table_name, self.id_field, id_param)
+            // Add ::numeric cast for DECIMAL ID fields
+            let id_param_with_cast = if let Some(col) = id_col_def {
+                if col.is_decimal {
+                    format!("{}::numeric", id_param)
+                } else {
+                    id_param
+                }
+            } else {
+                id_param
+            };
+
+            format!(r#"DELETE FROM {} WHERE {}={}"#, quoted_table, quoted_id_field, id_param_with_cast)
         })
     }
 
@@ -559,8 +734,9 @@ impl Scheme {
     pub fn gen_delete_where_sql_static(&self, where_stmt: &str) -> &'static str {
         let key = format!("{}-delete-where-{}", self.table_name, where_stmt);
         get_or_insert_sql(key, || {
+            let quoted_table = get_db().quote_identifier(&self.table_name);
             let where_sql = prepare_where(where_stmt, 1);
-            format!(r#"DELETE FROM {} WHERE {}"#, self.table_name, where_sql)
+            format!(r#"DELETE FROM {} WHERE {}"#, quoted_table, where_sql)
         })
     }
 
@@ -570,9 +746,32 @@ impl Scheme {
     pub fn gen_bulk_delete_sql_static(&self, count: usize) -> &'static str {
         let key = format!("{}-bulk-delete-{}", self.table_name, count);
         get_or_insert_sql(key, || {
-            let params: Vec<String> = (1..=count).map(|i| param_trans(format!("${}", i))).collect();
+            let db = get_db();
+            let quoted_table = db.quote_identifier(&self.table_name);
+            let quoted_id_field = db.quote_identifier(&self.id_field);
+
+            // Check if ID field is a DECIMAL or UUID field
+            let id_col_def = self.column_definitions.iter()
+                .find(|col| col.name == self.id_field);
+            let is_id_decimal = id_col_def
+                .map_or(false, |col| col.is_decimal);
+            let is_id_uuid = id_col_def
+                .map_or(false, |col| col.is_uuid);
+
+            let params: Vec<String> = (1..=count).map(|i| {
+                let p = param_trans(format!("${}", i));
+                // Add ::numeric cast for DECIMAL ID fields
+                if is_id_decimal {
+                    format!("{}::numeric", p)
+                // Add ::uuid cast for UUID ID fields
+                } else if is_id_uuid {
+                    format!("{}::uuid", p)
+                } else {
+                    p
+                }
+            }).collect();
             let params_str = params.join(",");
-            format!(r#"DELETE FROM {} WHERE {} IN ({})"#, self.table_name, self.id_field, params_str)
+            format!(r#"DELETE FROM {} WHERE {} IN ({})"#, quoted_table, quoted_id_field, params_str)
         })
     }
 
@@ -600,15 +799,38 @@ impl Scheme {
         let columns = self.gen_select_columns_static();
         let key = format!("{}-bulk-select-{}", self.table_name, count);
         get_or_insert_sql(key, || {
+            let db = get_db();
+            let quoted_table = db.quote_identifier(&self.table_name);
+            let quoted_id_field = db.quote_identifier(&self.id_field);
+
+            // Check if ID field is a DECIMAL or UUID field
+            let id_col_def = self.column_definitions.iter()
+                .find(|col| col.name == self.id_field);
+            let is_id_decimal = id_col_def
+                .map_or(false, |col| col.is_decimal);
+            let is_id_uuid = id_col_def
+                .map_or(false, |col| col.is_uuid);
+
             if count == 0 {
                 // Empty list: return a query that always returns empty result
-                format!(r#"SELECT {} FROM {} WHERE 1=0"#, columns, self.table_name)
+                format!(r#"SELECT {} FROM {} WHERE 1=0"#, columns, quoted_table)
             } else {
-                let params: Vec<String> = (1..=count).map(|i| param_trans(format!("${}", i))).collect();
+                let params: Vec<String> = (1..=count).map(|i| {
+                    let p = param_trans(format!("${}", i));
+                    // Add ::numeric cast for DECIMAL ID fields
+                    if is_id_decimal {
+                        format!("{}::numeric", p)
+                    // Add ::uuid cast for UUID ID fields
+                    } else if is_id_uuid {
+                        format!("{}::uuid", p)
+                    } else {
+                        p
+                    }
+                }).collect();
                 let in_clause = params.join(",");
                 format!(
                     r#"SELECT {} FROM {} WHERE {} IN ({})"#,
-                    columns, self.table_name, self.id_field, in_clause
+                    columns, quoted_table, quoted_id_field, in_clause
                 )
             }
         })
@@ -623,8 +845,26 @@ impl Scheme {
         let columns = self.gen_select_columns_static();
         let key = format!("{}-select-by-id", self.table_name);
         get_or_insert_sql(key, || {
+            let db = get_db();
+            let quoted_table = db.quote_identifier(&self.table_name);
+            let quoted_id_field = db.quote_identifier(&self.id_field);
+
+            // Check if ID field is a DECIMAL field
+            let id_col_def = self.column_definitions.iter()
+                .find(|col| col.name == self.id_field);
             let id_param = param_trans("$1".to_string());
-            format!(r#"SELECT {} FROM {} WHERE {}={}"#, columns, self.table_name, self.id_field, id_param)
+            // Add ::numeric cast for DECIMAL ID fields
+            let id_param_with_cast = if let Some(col) = id_col_def {
+                if col.is_decimal {
+                    format!("{}::numeric", id_param)
+                } else {
+                    id_param
+                }
+            } else {
+                id_param
+            };
+
+            format!(r#"SELECT {} FROM {} WHERE {}={}"#, columns, quoted_table, quoted_id_field, id_param_with_cast)
         })
     }
 
@@ -637,8 +877,9 @@ impl Scheme {
         let columns = self.gen_select_columns_static();
         let key = format!("{}-select-where-{}", self.table_name, where_stmt);
         get_or_insert_sql(key, || {
+            let quoted_table = get_db().quote_identifier(&self.table_name);
             let where_sql = prepare_where(where_stmt, 1);
-            format!(r#"SELECT {} FROM {} WHERE {}"#, columns, self.table_name, where_sql)
+            format!(r#"SELECT {} FROM {} WHERE {}"#, columns, quoted_table, where_sql)
         })
     }
 
@@ -653,8 +894,24 @@ impl Scheme {
     /// let sql = scheme.pre_sql_static("SELECT * FROM [Self] WHERE active = true");
     /// // Results in: "SELECT * FROM my_table WHERE active = true"
     /// ```
+    ///
+    /// **Note:** This method also replaces `SELECT *` with the actual column list
+    /// to ensure `cast_as` attributes are properly applied. For example:
+    /// ```ignore
+    /// // Input:  "SELECT * FROM [Self] WHERE id = $1"
+    /// // Output: "SELECT id, name, amount::TEXT as amount FROM my_table WHERE id = $1"
+    /// ```
     pub fn pre_sql_static(&self, sql: &str) -> String {
-        sql.replace("[Self]", self.table_name.as_str())
+        let quoted_table = get_db().quote_identifier(&self.table_name);
+        let sql = sql.replace("[Self]", quoted_table.as_str());
+
+        // Replace SELECT * with explicit column list to apply cast_as
+        if sql.contains("SELECT *") {
+            let columns = self.gen_select_columns_static();
+            sql.replace("SELECT *", &format!("SELECT {}", columns))
+        } else {
+            sql
+        }
     }
 }
 
@@ -664,6 +921,28 @@ enum DbType {
     PostgreSQL,
     MySQL,
     SQLite
+}
+
+impl DbType {
+    /// 为SQL标识符添加数据库特定的引号包装
+    ///
+    /// PostgreSQL: "identifier"
+    /// MySQL: `identifier`
+    /// SQLite: identifier (无引号)
+    ///
+    /// # 示例
+    /// ```
+    /// DbType::PostgreSQL.quote_identifier("user")  // "\"user\""
+    /// DbType::MySQL.quote_identifier("user")       // "`user`"
+    /// DbType::SQLite.quote_identifier("user")      // "user"
+    /// ```
+    pub fn quote_identifier(&self, identifier: &str) -> String {
+        match self {
+            DbType::PostgreSQL => format!("\"{}\"", identifier),
+            DbType::MySQL => format!("`{}`", identifier),
+            DbType::SQLite => identifier.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -683,13 +962,13 @@ mod tests {
         let sql = scheme.gen_insert_sql_static();
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "INSERT INTO users VALUES ($1,$2,$3)");
+        assert_eq!(sql, "INSERT INTO \"users\" (\"id\",\"name\",\"email\") VALUES ($1,$2,$3)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "INSERT INTO users VALUES (?,?,?)");
+        assert_eq!(sql, "INSERT INTO `users` (`id`,`name`,`email`) VALUES (?,?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
-        assert_eq!(sql, "INSERT INTO users VALUES (?,?,?)");
+        assert_eq!(sql, "INSERT INTO users (id,name,email) VALUES (?,?,?)");
     }
 
     #[test]
@@ -705,10 +984,10 @@ mod tests {
         let sql = scheme.gen_update_by_id_sql_static();
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE users SET name=$1,email=$2 WHERE id=$3");
+        assert_eq!(sql, "UPDATE \"users\" SET \"name\"=$1,\"email\"=$2 WHERE \"id\"=$3");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE users SET name=?,email=? WHERE id=?");
+        assert_eq!(sql, "UPDATE `users` SET `name`=?,`email`=? WHERE `id`=?");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE users SET name=?,email=? WHERE id=?");
@@ -727,10 +1006,10 @@ mod tests {
         let sql = scheme.gen_delete_sql_static();
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "DELETE FROM users WHERE id=$1");
+        assert_eq!(sql, "DELETE FROM \"users\" WHERE \"id\"=$1");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "DELETE FROM users WHERE id=?");
+        assert_eq!(sql, "DELETE FROM `users` WHERE `id`=?");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM users WHERE id=?");
@@ -749,10 +1028,10 @@ mod tests {
         let sql = scheme.gen_select_by_id_sql_static();
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM users WHERE id=$1");
+        assert_eq!(sql, "SELECT * FROM \"users\" WHERE \"id\"=$1");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "SELECT * FROM users WHERE id=?");
+        assert_eq!(sql, "SELECT * FROM `users` WHERE `id`=?");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM users WHERE id=?");
@@ -767,15 +1046,123 @@ mod tests {
             update_fields: vec!["commission_rate".to_string()],
             id_field: "id".to_string(),
             column_definitions: vec![
-                ColumnDefinition { name: "id".to_string(), cast_as: None },
-                ColumnDefinition { name: "commission_rate".to_string(), cast_as: Some("TEXT".to_string()) },
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+                ColumnDefinition { name: "commission_rate".to_string(), cast_as: Some("TEXT".to_string()), is_decimal: true, is_uuid: false },
             ],
         };
 
         let sql = scheme.gen_select_by_id_sql_static();
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT id, commission_rate::TEXT as commission_rate FROM decimal_users WHERE id=$1");
+        assert_eq!(sql, "SELECT \"id\", \"commission_rate\"::TEXT as \"commission_rate\" FROM \"decimal_users\" WHERE \"id\"=$1");
+    }
+
+    #[test]
+    fn test_bulk_insert_with_decimal_cast_as() {
+        // Test bulk insert with DECIMAL fields (is_decimal=true)
+        let scheme = Scheme {
+            table_name: "products_bulk_decimal".to_string(),
+            insert_fields: vec!["id".to_string(), "name".to_string(), "price".to_string(), "discount".to_string()],
+            update_fields: vec!["name".to_string(), "price".to_string(), "discount".to_string()],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+                ColumnDefinition { name: "name".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+                ColumnDefinition { name: "price".to_string(), cast_as: Some("TEXT".to_string()), is_decimal: true, is_uuid: false },
+                ColumnDefinition { name: "discount".to_string(), cast_as: Some("TEXT".to_string()), is_decimal: true, is_uuid: false },
+            ],
+        };
+
+        let sql = scheme.gen_bulk_insert_sql_static(2);
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "INSERT INTO \"products_bulk_decimal\" VALUES ($1,$2,$3::numeric,$4::numeric),($5,$6,$7::numeric,$8::numeric)");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "INSERT INTO `products_bulk_decimal` VALUES (?,?,?,?),(?,?,?,?)");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "INSERT INTO products_bulk_decimal VALUES (?,?,?,?),(?,?,?,?)");
+    }
+
+    #[test]
+    fn test_bulk_update_with_decimal_cast_as() {
+        // Test bulk update with DECIMAL fields (is_decimal=true)
+        let scheme = Scheme {
+            table_name: "products_bulk_update_decimal".to_string(),
+            insert_fields: vec!["id".to_string(), "price".to_string(), "discount".to_string()],
+            update_fields: vec!["price".to_string(), "discount".to_string()],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+                ColumnDefinition { name: "price".to_string(), cast_as: Some("TEXT".to_string()), is_decimal: true, is_uuid: false },
+                ColumnDefinition { name: "discount".to_string(), cast_as: Some("TEXT".to_string()), is_decimal: true, is_uuid: false },
+            ],
+        };
+
+        let sql = scheme.gen_bulk_update_sql_static(2);
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "UPDATE \"products_bulk_update_decimal\" SET \"price\"=CASE \"id\" WHEN $1 THEN $2::numeric WHEN $3 THEN $4::numeric END,\"discount\"=CASE \"id\" WHEN $5 THEN $6::numeric WHEN $7 THEN $8::numeric END WHERE \"id\" IN ($9,$10)");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "UPDATE `products_bulk_update_decimal` SET `price`=CASE `id` WHEN ? THEN ? WHEN ? THEN ? END,`discount`=CASE `id` WHEN ? THEN ? WHEN ? THEN ? END WHERE `id` IN (?,?)");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "UPDATE products_bulk_update_decimal SET price=CASE WHEN ? THEN ? WHEN ? THEN ? END,discount=CASE WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
+    }
+
+    #[test]
+    fn test_single_insert_with_decimal_cast_as() {
+        // Test single insert with DECIMAL fields (is_decimal=true)
+        let scheme = Scheme {
+            table_name: "products_single_decimal".to_string(),
+            insert_fields: vec!["id".to_string(), "name".to_string(), "price".to_string()],
+            update_fields: vec!["name".to_string(), "price".to_string()],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+                ColumnDefinition { name: "name".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+                ColumnDefinition { name: "price".to_string(), cast_as: Some("TEXT".to_string()), is_decimal: true, is_uuid: false },
+            ],
+        };
+
+        let sql = scheme.gen_insert_sql_static();
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "INSERT INTO \"products_single_decimal\" (\"id\",\"name\",\"price\") VALUES ($1,$2,$3::numeric)");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "INSERT INTO `products_single_decimal` (`id`,`name`,`price`) VALUES (?,?,?)");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "INSERT INTO products_single_decimal (id,name,price) VALUES (?,?,?)");
+    }
+
+    #[test]
+    fn test_single_update_with_decimal_cast_as() {
+        // Test single update with DECIMAL fields (is_decimal=true)
+        let scheme = Scheme {
+            table_name: "products_update_decimal".to_string(),
+            insert_fields: vec!["id".to_string(), "price".to_string()],
+            update_fields: vec!["price".to_string()],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+                ColumnDefinition { name: "price".to_string(), cast_as: Some("TEXT".to_string()), is_decimal: true, is_uuid: false },
+            ],
+        };
+
+        let sql = scheme.gen_update_by_id_sql_static();
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "UPDATE \"products_update_decimal\" SET \"price\"=$1::numeric WHERE \"id\"=$2");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "UPDATE `products_update_decimal` SET `price`=? WHERE `id`=?");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "UPDATE products_update_decimal SET price=? WHERE id=?");
     }
 
     #[test]
@@ -789,6 +1176,14 @@ mod tests {
         };
 
         let sql = scheme.gen_count_sql_static("active = true");
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT COUNT(*) FROM \"orders\" WHERE active = true");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT COUNT(*) FROM `orders` WHERE active = true");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT COUNT(*) FROM orders WHERE active = true");
     }
 
@@ -803,6 +1198,14 @@ mod tests {
         };
 
         let sql = scheme.pre_sql_static("SELECT * FROM [Self] WHERE active = true");
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT * FROM \"my_table\" WHERE active = true");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT * FROM `my_table` WHERE active = true");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM my_table WHERE active = true");
     }
 
@@ -854,6 +1257,14 @@ mod tests {
         };
 
         let sql = scheme.gen_select_where_sql_static("1=1");
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT * FROM \"users\" WHERE 1=1");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT * FROM `users` WHERE 1=1");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM users WHERE 1=1");
     }
 
@@ -870,10 +1281,10 @@ mod tests {
         let sql = scheme.gen_update_where_sql_static("category = {}");
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE products SET name=$1,price=$2 WHERE category = $3");
+        assert_eq!(sql, "UPDATE \"products\" SET \"name\"=$1,\"price\"=$2 WHERE category = $3");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE products SET name=?,price=? WHERE category = ?");
+        assert_eq!(sql, "UPDATE `products` SET `name`=?,`price`=? WHERE category = ?");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE products SET name=?,price=? WHERE category = ?");
@@ -892,10 +1303,10 @@ mod tests {
         let sql = scheme.gen_delete_where_sql_static("created_at < NOW()");
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "DELETE FROM logs WHERE created_at < NOW()");
+        assert_eq!(sql, "DELETE FROM \"logs\" WHERE created_at < NOW()");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "DELETE FROM logs WHERE created_at < NOW()");
+        assert_eq!(sql, "DELETE FROM `logs` WHERE created_at < NOW()");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM logs WHERE created_at < NOW()");
@@ -940,13 +1351,13 @@ mod tests {
         let sql = scheme.gen_insert_sql_static();
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "INSERT INTO minimal VALUES ($1)");
+        assert_eq!(sql, "INSERT INTO \"minimal\" (\"id\") VALUES ($1)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "INSERT INTO minimal VALUES (?)");
+        assert_eq!(sql, "INSERT INTO `minimal` (`id`) VALUES (?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
-        assert_eq!(sql, "INSERT INTO minimal VALUES (?)");
+        assert_eq!(sql, "INSERT INTO minimal (id) VALUES (?)");
     }
 
     #[test]
@@ -983,6 +1394,14 @@ mod tests {
         };
 
         let sql = scheme.gen_insert_sql_static();
+
+        #[cfg(feature = "postgres")]
+        assert!(sql.contains("\"user_profiles\""), "Table name should be quoted");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert!(sql.contains("`user_profiles`"), "Table name should be quoted");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert!(sql.contains("user_profiles"), "Table name should be preserved");
     }
 
@@ -1001,9 +1420,12 @@ mod tests {
         );
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM orders WHERE status = 'active' AND created_at > $1 AND payment_status = $2");
+        assert_eq!(sql, "SELECT * FROM \"orders\" WHERE status = 'active' AND created_at > $1 AND payment_status = $2");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT * FROM `orders` WHERE status = 'active' AND created_at > ? AND payment_status = ?");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM orders WHERE status = 'active' AND created_at > ? AND payment_status = ?");
     }
 
@@ -1020,6 +1442,20 @@ mod tests {
         let sql = scheme.pre_sql_static(
             "SELECT * FROM [Self] WHERE [Self].created_at > [Self].updated_at"
         );
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"users\" WHERE \"users\".created_at > \"users\".updated_at"
+        );
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(
+            sql,
+            "SELECT * FROM `users` WHERE `users`.created_at > `users`.updated_at"
+        );
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(
             sql,
             "SELECT * FROM users WHERE users.created_at > users.updated_at"
@@ -1040,7 +1476,15 @@ mod tests {
             "amount > 100 AND status IN ('pending', 'completed')"
         );
 
+        #[cfg(feature = "postgres")]
+        assert!(sql.contains("SELECT COUNT(*) FROM \"transactions\""));
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert!(sql.contains("SELECT COUNT(*) FROM `transactions`"));
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert!(sql.contains("SELECT COUNT(*) FROM transactions"));
+
         assert!(sql.contains("amount > 100"));
         assert!(sql.contains("status IN ('pending', 'completed')"));
     }
@@ -1059,7 +1503,15 @@ mod tests {
             "user_id IN (SELECT id FROM users WHERE banned = true)"
         );
 
+        #[cfg(feature = "postgres")]
+        assert!(sql.contains("DELETE FROM \"logs\" WHERE"));
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert!(sql.contains("DELETE FROM `logs` WHERE"));
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert!(sql.contains("DELETE FROM logs WHERE"));
+
         assert!(sql.contains("user_id IN"));
     }
 
@@ -1076,9 +1528,12 @@ mod tests {
         let sql = scheme.gen_update_where_sql_static("key = 'app_version'");
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE config SET value=$1 WHERE key = 'app_version'");
+        assert_eq!(sql, "UPDATE \"config\" SET \"value\"=$1 WHERE key = 'app_version'");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "UPDATE `config` SET `value`=? WHERE key = 'app_version'");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE config SET value=? WHERE key = 'app_version'");
     }
 
@@ -1096,10 +1551,13 @@ mod tests {
         let sql = scheme.gen_insert_sql_static();
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "INSERT INTO user_profile_settings VALUES ($1)");
+        assert_eq!(sql, "INSERT INTO \"user_profile_settings\" (\"id\") VALUES ($1)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "INSERT INTO user_profile_settings VALUES (?)");
+        assert_eq!(sql, "INSERT INTO `user_profile_settings` (`id`) VALUES (?)");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "INSERT INTO user_profile_settings (id) VALUES (?)");
     }
 
     #[test]
@@ -1115,9 +1573,12 @@ mod tests {
         let sql = scheme.gen_select_by_id_sql_static();
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM app_users WHERE id=$1");
+        assert_eq!(sql, "SELECT * FROM \"app_users\" WHERE \"id\"=$1");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT * FROM `app_users` WHERE `id`=?");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM app_users WHERE id=?");
     }
 
@@ -1135,10 +1596,10 @@ mod tests {
         let sql = scheme.gen_delete_where_sql_static("level = 'DEBUG'");
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "DELETE FROM logs WHERE level = 'DEBUG'");
+        assert_eq!(sql, "DELETE FROM \"logs\" WHERE level = 'DEBUG'");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "DELETE FROM logs WHERE level = 'DEBUG'");
+        assert_eq!(sql, "DELETE FROM `logs` WHERE level = 'DEBUG'");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM logs WHERE level = 'DEBUG'");
@@ -1157,10 +1618,10 @@ mod tests {
         let sql = scheme.gen_delete_where_sql_static("expires_at < {}");
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "DELETE FROM sessions WHERE expires_at < $1");
+        assert_eq!(sql, "DELETE FROM \"sessions\" WHERE expires_at < $1");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "DELETE FROM sessions WHERE expires_at < ?");
+        assert_eq!(sql, "DELETE FROM `sessions` WHERE expires_at < ?");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM sessions WHERE expires_at < ?");
@@ -1180,7 +1641,15 @@ mod tests {
             "created_at < NOW() - INTERVAL '30 days' AND status = 'expired'"
         );
 
+        #[cfg(feature = "postgres")]
+        assert!(sql.contains("DELETE FROM \"temp_data\" WHERE"));
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert!(sql.contains("DELETE FROM `temp_data` WHERE"));
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert!(sql.contains("DELETE FROM temp_data WHERE"));
+
         assert!(sql.contains("created_at < NOW() - INTERVAL '30 days'"));
         assert!(sql.contains("status = 'expired'"));
     }
@@ -1198,9 +1667,12 @@ mod tests {
         let sql = scheme.gen_delete_where_sql_static("status = {} AND created_at < {}");
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "DELETE FROM events WHERE status = $1 AND created_at < $2");
+        assert_eq!(sql, "DELETE FROM \"events\" WHERE status = $1 AND created_at < $2");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "DELETE FROM `events` WHERE status = ? AND created_at < ?");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM events WHERE status = ? AND created_at < ?");
     }
 
@@ -1235,10 +1707,10 @@ mod tests {
         let sql = scheme.gen_bulk_delete_sql_static(1);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "DELETE FROM users WHERE id IN ($1)");
+        assert_eq!(sql, "DELETE FROM \"users\" WHERE \"id\" IN ($1)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "DELETE FROM users WHERE id IN (?)");
+        assert_eq!(sql, "DELETE FROM `users` WHERE `id` IN (?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM users WHERE id IN (?)");
@@ -1257,10 +1729,10 @@ mod tests {
         let sql = scheme.gen_bulk_delete_sql_static(3);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "DELETE FROM products WHERE id IN ($1,$2,$3)");
+        assert_eq!(sql, "DELETE FROM \"products\" WHERE \"id\" IN ($1,$2,$3)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "DELETE FROM products WHERE id IN (?,?,?)");
+        assert_eq!(sql, "DELETE FROM `products` WHERE `id` IN (?,?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM products WHERE id IN (?,?,?)");
@@ -1281,13 +1753,13 @@ mod tests {
         #[cfg(feature = "postgres")]
         {
             let expected = (1..=100).map(|i| format!("${}", i)).collect::<Vec<_>>().join(",");
-            assert_eq!(sql, format!("DELETE FROM logs WHERE id IN ({})", expected));
+            assert_eq!(sql, format!("DELETE FROM \"logs\" WHERE \"id\" IN ({})", expected));
         }
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
         {
             let expected = (1..=100).map(|_| "?").collect::<Vec<_>>().join(",");
-            assert_eq!(sql, format!("DELETE FROM logs WHERE id IN ({})", expected));
+            assert_eq!(sql, format!("DELETE FROM `logs` WHERE `id` IN ({})", expected));
         }
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
@@ -1346,10 +1818,10 @@ mod tests {
         let sql = scheme.gen_bulk_delete_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "DELETE FROM orders WHERE order_id IN ($1,$2)");
+        assert_eq!(sql, "DELETE FROM \"orders\" WHERE \"order_id\" IN ($1,$2)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "DELETE FROM orders WHERE order_id IN (?,?)");
+        assert_eq!(sql, "DELETE FROM `orders` WHERE `order_id` IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM orders WHERE order_id IN (?,?)");
@@ -1368,10 +1840,10 @@ mod tests {
         let sql = scheme.gen_bulk_delete_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "DELETE FROM app.users WHERE id IN ($1,$2)");
+        assert_eq!(sql, "DELETE FROM \"app.users\" WHERE \"id\" IN ($1,$2)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "DELETE FROM app.users WHERE id IN (?,?)");
+        assert_eq!(sql, "DELETE FROM `app.users` WHERE `id` IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "DELETE FROM app.users WHERE id IN (?,?)");
@@ -1390,10 +1862,10 @@ mod tests {
         let sql = scheme.gen_bulk_select_sql_static(1);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM users WHERE id IN ($1)");
+        assert_eq!(sql, "SELECT * FROM \"users\" WHERE \"id\" IN ($1)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "SELECT * FROM users WHERE id IN (?)");
+        assert_eq!(sql, "SELECT * FROM `users` WHERE `id` IN (?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM users WHERE id IN (?)");
@@ -1412,10 +1884,10 @@ mod tests {
         let sql = scheme.gen_bulk_select_sql_static(3);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM products WHERE id IN ($1,$2,$3)");
+        assert_eq!(sql, "SELECT * FROM \"products\" WHERE \"id\" IN ($1,$2,$3)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "SELECT * FROM products WHERE id IN (?,?,?)");
+        assert_eq!(sql, "SELECT * FROM `products` WHERE `id` IN (?,?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM products WHERE id IN (?,?,?)");
@@ -1432,6 +1904,14 @@ mod tests {
         };
 
         let sql = scheme.gen_bulk_select_sql_static(0);
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT * FROM \"users\" WHERE 1=0");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT * FROM `users` WHERE 1=0");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM users WHERE 1=0");
     }
 
@@ -1450,7 +1930,7 @@ mod tests {
         #[cfg(feature = "postgres")]
         {
             let in_params = (1..=100).map(|i| format!("${}", i)).collect::<Vec<_>>().join(",");
-            let expected = format!("SELECT * FROM logs WHERE id IN ({})", in_params);
+            let expected = format!("SELECT * FROM \"logs\" WHERE \"id\" IN ({})", in_params);
             assert_eq!(sql, expected);
         }
 
@@ -1458,7 +1938,7 @@ mod tests {
         {
             let in_params = (1..=100).map(|_| "?").collect::<Vec<_>>().join(",");
             let order_by_params = (0..100).map(|i| format!("WHEN ? THEN {}", i)).collect::<Vec<_>>().join("\n    ");
-            let expected = format!("SELECT * FROM logs WHERE id IN ({}) ORDER BY CASE id\n    {}\nEND", in_params, order_by_params);
+            let expected = format!("SELECT * FROM `logs` WHERE `id` IN ({}) ORDER BY CASE `id`\n    {}\nEND", in_params, order_by_params);
             assert_eq!(sql, expected);
         }
 
@@ -1520,10 +2000,10 @@ mod tests {
         let sql = scheme.gen_bulk_select_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN ($1,$2)");
+        assert_eq!(sql, "SELECT * FROM \"orders\" WHERE \"order_id\" IN ($1,$2)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN (?,?)");
+        assert_eq!(sql, "SELECT * FROM `orders` WHERE `order_id` IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM orders WHERE order_id IN (?,?)");
@@ -1542,10 +2022,10 @@ mod tests {
         let sql = scheme.gen_bulk_select_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN ($1,$2)");
+        assert_eq!(sql, "SELECT * FROM \"app.users\" WHERE \"id\" IN ($1,$2)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "SELECT * FROM app.users WHERE id IN (?,?)");
+        assert_eq!(sql, "SELECT * FROM `app.users` WHERE `id` IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "SELECT * FROM app.users WHERE id IN (?,?)");
@@ -1564,10 +2044,10 @@ mod tests {
         let sql = scheme.gen_bulk_insert_sql_static(1);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "INSERT INTO users VALUES ($1,$2,$3)");
+        assert_eq!(sql, "INSERT INTO \"users\" VALUES ($1,$2,$3)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "INSERT INTO users VALUES (?,?,?)");
+        assert_eq!(sql, "INSERT INTO `users` VALUES (?,?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "INSERT INTO users VALUES (?,?,?)");
@@ -1586,10 +2066,10 @@ mod tests {
         let sql = scheme.gen_bulk_insert_sql_static(3);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "INSERT INTO products VALUES ($1,$2,$3),($4,$5,$6),($7,$8,$9)");
+        assert_eq!(sql, "INSERT INTO \"products\" VALUES ($1,$2,$3),($4,$5,$6),($7,$8,$9)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "INSERT INTO products VALUES (?,?,?),(?,?,?),(?,?,?)");
+        assert_eq!(sql, "INSERT INTO `products` VALUES (?,?,?),(?,?,?),(?,?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "INSERT INTO products VALUES (?,?,?),(?,?,?),(?,?,?)");
@@ -1608,10 +2088,10 @@ mod tests {
         let sql = scheme.gen_bulk_insert_sql_static(4);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "INSERT INTO categories VALUES ($1,$2),($3,$4),($5,$6),($7,$8)");
+        assert_eq!(sql, "INSERT INTO \"categories\" VALUES ($1,$2),($3,$4),($5,$6),($7,$8)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "INSERT INTO categories VALUES (?,?),(?,?,?),(?,?,?),(?,?)");
+        assert_eq!(sql, "INSERT INTO `categories` VALUES (?,?),(?,?,?),(?,?,?),(?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "INSERT INTO categories VALUES (?,?),(?,?,?),(?,?,?),(?,?)");
@@ -1632,7 +2112,7 @@ mod tests {
         #[cfg(feature = "postgres")]
         {
             // Should have 50 rows with 3 fields each (150 parameters total)
-            assert!(sql.contains("INSERT INTO logs VALUES"));
+            assert!(sql.contains("INSERT INTO \"logs\" VALUES"));
             assert!(sql.contains("($1,$2,$3)"));
             assert!(sql.contains("($148,$149,$150)"));
         }
@@ -1700,10 +2180,10 @@ mod tests {
         let sql = scheme.gen_bulk_insert_sql_static(5);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "INSERT INTO tags VALUES ($1),($2),($3),($4),($5)");
+        assert_eq!(sql, "INSERT INTO \"tags\" VALUES ($1),($2),($3),($4),($5)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "INSERT INTO tags VALUES (?),(?),(?),(?),(?)");
+        assert_eq!(sql, "INSERT INTO `tags` VALUES (?),(?),(?),(?),(?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "INSERT INTO tags VALUES (?),(?),(?),(?),(?)");
@@ -1722,10 +2202,10 @@ mod tests {
         let sql = scheme.gen_bulk_insert_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "INSERT INTO app.users VALUES ($1,$2),($3,$4)");
+        assert_eq!(sql, "INSERT INTO \"app.users\" VALUES ($1,$2),($3,$4)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "INSERT INTO app.users VALUES (?,?),(?,?)");
+        assert_eq!(sql, "INSERT INTO `app.users` VALUES (?,?),(?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "INSERT INTO app.users VALUES (?,?),(?,?)");
@@ -1744,10 +2224,10 @@ mod tests {
         let sql = scheme.gen_bulk_update_sql_static(1);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE users SET name=CASE id WHEN $1 THEN $2 END,email=CASE id WHEN $3 THEN $4 END WHERE id IN ($5)");
+        assert_eq!(sql, "UPDATE \"users\" SET \"name\"=CASE \"id\" WHEN $1 THEN $2 END,\"email\"=CASE \"id\" WHEN $3 THEN $4 END WHERE \"id\" IN ($5)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE users SET name=CASE id WHEN ? THEN ? END,email=CASE id WHEN ? THEN ? END WHERE id IN (?)");
+        assert_eq!(sql, "UPDATE `users` SET `name`=CASE `id` WHEN ? THEN ? END,`email`=CASE `id` WHEN ? THEN ? END WHERE `id` IN (?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE users SET name=CASE WHEN ? THEN ? END,email=CASE WHEN ? THEN ? END WHERE id IN (?)");
@@ -1766,10 +2246,10 @@ mod tests {
         let sql = scheme.gen_bulk_update_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE products SET name=CASE id WHEN $1 THEN $2 WHEN $3 THEN $4 END,price=CASE id WHEN $5 THEN $6 WHEN $7 THEN $8 END WHERE id IN ($9,$10)");
+        assert_eq!(sql, "UPDATE \"products\" SET \"name\"=CASE \"id\" WHEN $1 THEN $2 WHEN $3 THEN $4 END,\"price\"=CASE \"id\" WHEN $5 THEN $6 WHEN $7 THEN $8 END WHERE \"id\" IN ($9,$10)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE products SET name=CASE id WHEN ? THEN ? WHEN ? THEN ? END,price=CASE id WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
+        assert_eq!(sql, "UPDATE `products` SET `name`=CASE `id` WHEN ? THEN ? WHEN ? THEN ? END,`price`=CASE `id` WHEN ? THEN ? WHEN ? THEN ? END WHERE `id` IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE products SET name=CASE WHEN ? THEN ? WHEN ? THEN ? END,price=CASE WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
@@ -1788,10 +2268,10 @@ mod tests {
         let sql = scheme.gen_bulk_update_sql_static(3);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE categories SET name=CASE id WHEN $1 THEN $2 WHEN $3 THEN $4 WHEN $5 THEN $6 END WHERE id IN ($7,$8,$9)");
+        assert_eq!(sql, "UPDATE \"categories\" SET \"name\"=CASE \"id\" WHEN $1 THEN $2 WHEN $3 THEN $4 WHEN $5 THEN $6 END WHERE \"id\" IN ($7,$8,$9)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE categories SET name=CASE id WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?,?)");
+        assert_eq!(sql, "UPDATE `categories` SET `name`=CASE `id` WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? END WHERE `id` IN (?,?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE categories SET name=CASE WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?,?)");
@@ -1814,7 +2294,7 @@ mod tests {
             // Should have 10 WHEN clauses per field (2 fields = 20 WHEN clauses)
             assert_eq!(sql.matches("WHEN").count(), 20);
             // Should have IN clause with 10 parameters
-            assert!(sql.contains("WHERE id IN ($"));
+            assert!(sql.contains("WHERE \"id\" IN ($"));
         }
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
@@ -1883,10 +2363,10 @@ mod tests {
 
         // Edge case: no update fields, should only have WHERE IN clause
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE tags SET  WHERE id IN ($1,$2)");
+        assert_eq!(sql, "UPDATE \"tags\" SET  WHERE \"id\" IN ($1,$2)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE tags SET  WHERE id IN (?,?)");
+        assert_eq!(sql, "UPDATE `tags` SET  WHERE `id` IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE tags SET  WHERE id IN (?,?)");
@@ -1905,10 +2385,10 @@ mod tests {
         let sql = scheme.gen_bulk_update_sql_static(2);
 
         #[cfg(feature = "postgres")]
-        assert_eq!(sql, "UPDATE app.users SET username=CASE id WHEN $1 THEN $2 WHEN $3 THEN $4 END WHERE id IN ($5,$6)");
+        assert_eq!(sql, "UPDATE \"app.users\" SET \"username\"=CASE \"id\" WHEN $1 THEN $2 WHEN $3 THEN $4 END WHERE \"id\" IN ($5,$6)");
 
         #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        assert_eq!(sql, "UPDATE app.users SET username=CASE id WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
+        assert_eq!(sql, "UPDATE `app.users` SET `username`=CASE `id` WHEN ? THEN ? WHEN ? THEN ? END WHERE `id` IN (?,?)");
 
         #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
         assert_eq!(sql, "UPDATE app.users SET username=CASE WHEN ? THEN ? WHEN ? THEN ? END WHERE id IN (?,?)");
@@ -1986,6 +2466,107 @@ mod tests {
         check_compile_time(|| {
             let _: SqlitePool = unsafe { std::mem::zeroed() };
         });
+    }
+
+    // UUID bulk operations tests
+    #[test]
+    fn test_bulk_delete_with_uuid_id() {
+        let scheme = Scheme {
+            table_name: "orders".to_string(),
+            insert_fields: vec!["id".to_string(), "customer_name".to_string()],
+            update_fields: vec!["customer_name".to_string()],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: false, is_uuid: true },
+                ColumnDefinition { name: "customer_name".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+            ],
+        };
+
+        let sql = scheme.gen_bulk_delete_sql_static(3);
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "DELETE FROM \"orders\" WHERE \"id\" IN ($1::uuid,$2::uuid,$3::uuid)");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "DELETE FROM `orders` WHERE `id` IN (?,?,?)");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "DELETE FROM orders WHERE id IN (?,?,?)");
+    }
+
+    #[test]
+    fn test_bulk_select_with_uuid_id() {
+        let scheme = Scheme {
+            table_name: "orders_uuid_test".to_string(),
+            insert_fields: vec!["id".to_string(), "customer_name".to_string()],
+            update_fields: vec!["customer_name".to_string()],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: false, is_uuid: true },
+                ColumnDefinition { name: "customer_name".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+            ],
+        };
+
+        let sql = scheme.gen_bulk_select_sql_static(3);
+
+        #[cfg(feature = "postgres")]
+        assert_eq!(sql, "SELECT \"id\", \"customer_name\" FROM \"orders_uuid_test\" WHERE \"id\" IN ($1::uuid,$2::uuid,$3::uuid)");
+
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        assert_eq!(sql, "SELECT `id`, `customer_name` FROM `orders_uuid_test` WHERE `id` IN (?,?,?)");
+
+        #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
+        assert_eq!(sql, "SELECT id, customer_name FROM orders_uuid_test WHERE id IN (?,?,?)");
+    }
+
+    #[test]
+    fn test_bulk_operations_uuid_vs_decimal_vs_regular() {
+        // UUID ID
+        let scheme_uuid = Scheme {
+            table_name: "uuid_table".to_string(),
+            insert_fields: vec!["id".to_string()],
+            update_fields: vec![],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: false, is_uuid: true },
+            ],
+        };
+
+        // DECIMAL ID
+        let scheme_decimal = Scheme {
+            table_name: "decimal_table".to_string(),
+            insert_fields: vec!["id".to_string()],
+            update_fields: vec![],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: true, is_uuid: false },
+            ],
+        };
+
+        // Regular ID
+        let scheme_regular = Scheme {
+            table_name: "regular_table".to_string(),
+            insert_fields: vec!["id".to_string()],
+            update_fields: vec![],
+            id_field: "id".to_string(),
+            column_definitions: vec![
+                ColumnDefinition { name: "id".to_string(), cast_as: None, is_decimal: false, is_uuid: false },
+            ],
+        };
+
+        let sql_uuid = scheme_uuid.gen_bulk_delete_sql_static(2);
+        let sql_decimal = scheme_decimal.gen_bulk_delete_sql_static(2);
+        let sql_regular = scheme_regular.gen_bulk_delete_sql_static(2);
+
+        #[cfg(feature = "postgres")]
+        {
+            assert!(sql_uuid.contains("::uuid"), "UUID should have ::uuid cast");
+            assert!(sql_decimal.contains("::numeric"), "DECIMAL should have ::numeric cast");
+            assert!(!sql_regular.contains("::"), "Regular ID should not have cast");
+            assert_eq!(sql_uuid, "DELETE FROM \"uuid_table\" WHERE \"id\" IN ($1::uuid,$2::uuid)");
+            assert_eq!(sql_decimal, "DELETE FROM \"decimal_table\" WHERE \"id\" IN ($1::numeric,$2::numeric)");
+            assert_eq!(sql_regular, "DELETE FROM \"regular_table\" WHERE \"id\" IN ($1,$2)");
+        }
     }
 }
 

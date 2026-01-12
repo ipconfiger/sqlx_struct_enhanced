@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("1️⃣  BEFORE - Manual Type Conversion:");
     println!("   ----------------------------------");
     println!("   let min_price = rust_decimal::Decimal::from_str(\"10.00\")?;");
-    println!("   let products = Product::where_query(\"price >= {}\")");
+    println!("   let products = Product::where_query(\"price >= {{}}\")");
     println!("       .bind(min_price.to_string())  // Manual conversion ❌");
     println!("       .fetch_all(&pool)");
     println!("       .await?;\n");
@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("2️⃣  AFTER - Automatic Type Conversion:");
     println!("   ------------------------------------");
     println!("   let min_price = rust_decimal::Decimal::from_str(\"10.00\")?;");
-    println!("   let products = Product::where_query_ext(\"price >= {}\")");
+    println!("   let products = Product::where_query_ext(\"price >= {{}}\")");
     println!("       .bind_proxy(min_price)  // Automatic conversion ✨");
     println!("       .fetch_all(&pool)");
     println!("       .await?;\n");
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   -----------------------------");
     println!("   let min_price = rust_decimal::Decimal::from_str(\"100.00\")?;");
     println!("   let max_price = rust_decimal::Decimal::from_str(\"500.00\")?;");
-    println!("   let products = Product::where_query_ext(\"price BETWEEN {} AND {}\")");
+    println!("   let products = Product::where_query_ext(\"price BETWEEN {{}} AND {{}}\")");
     println!("       .bind_proxy(min_price)");
     println!("       .bind_proxy(max_price)");
     println!("       .fetch_all(&pool)");
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   let price = rust_decimal::Decimal::from_str(\"99.99\")?;");
     println!("   let in_stock = true;");
     println!("   let min_stock = 10;");
-    println!("   let products = Product::where_query_ext(\"price > {} AND in_stock = {} AND stock >= {}\")");
+    println!("   let products = Product::where_query_ext(\"price > {{}} AND in_stock = {{}} AND stock >= {{}}\")");
     println!("       .bind_proxy(price)    // DECIMAL auto-conversion");
     println!("       .bind_proxy(in_stock)  // bool auto-conversion");
     println!("       .bind_proxy(min_stock) // i32 auto-conversion");
@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("5️⃣  DELETE with DECIMAL:");
     println!("   ---------------------");
     println!("   let max_price = rust_decimal::Decimal::from_str(\"5.00\")?;");
-    println!("   let deleted = Product::delete_where_query_ext(\"price < {}\")");
+    println!("   let deleted = Product::delete_where_query_ext(\"price < {{}}\")");
     println!("       .bind_proxy(max_price)");
     println!("       .execute(&pool)");
     println!("       .await?;\n");
@@ -90,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("6️⃣  COUNT with DECIMAL:");
     println!("   -------------------");
     println!("   let min_price = rust_decimal::Decimal::from_str(\"100.00\")?;");
-    println!("   let (count,) = Product::count_query_ext(\"price > {}\")");
+    println!("   let (count,) = Product::count_query_ext(\"price > {{}}\")");
     println!("       .bind_proxy(min_price)");
     println!("       .fetch_one(&pool)");
     println!("       .await?;\n");

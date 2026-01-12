@@ -12,7 +12,7 @@
 #[cfg(all(feature = "postgres", feature = "all-types"))]
 #[cfg(test)]
 mod extended_types_integration_tests {
-    use sqlx::{FromRow, PgPool, Postgres};
+    use sqlx::{FromRow, PgPool, Postgres, Row};
     use sqlx::query::{Query, QueryAs};
     use sqlx::database::HasArguments;
     use sqlx_struct_enhanced::{EnhancedCrud, EnhancedCrudExt, EnhancedQuery, Scheme};

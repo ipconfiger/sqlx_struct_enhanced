@@ -14,6 +14,7 @@ use sqlx::query::{Query, QueryAs};
 use sqlx::database::HasArguments;
 
 use sqlx::FromRow;
+use sqlx::Row;
 use sqlx_struct_enhanced::{EnhancedCrud, Scheme};
 
 // Example 1: Custom table name

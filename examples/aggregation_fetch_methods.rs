@@ -7,7 +7,7 @@
 // Run with: cargo run --example aggregation_fetch_methods
 
 use sqlx_struct_enhanced::EnhancedCrud;
-use sqlx::{FromRow, PgPool, Postgres};
+use sqlx::{FromRow, PgPool, Postgres, Row as _};
 use sqlx::database::HasArguments;
 use sqlx::query::{Query, QueryAs};
 

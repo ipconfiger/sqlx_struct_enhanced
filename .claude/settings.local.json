@@ -34,7 +34,20 @@
       "Bash(rustc:*)",
       "Bash(/tmp/proxy_poc:*)",
       "Bash(/tmp/proxy_mvp:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(DATABASE_URL=\"postgres://postgres:@127.0.0.1/test-sqlx-tokio\" cargo test:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(docker compose:*)",
+      "Bash(for:*)",
+      "Bash(break:*)",
+      "Bash(docker exec:*)",
+      "Bash(MYSQL_DATABASE_URL=\"mysql://root:test@127.0.0.1:3306/test_sqlx\" cargo test:*)",
+      "Bash(find:*)",
+      "Bash(cargo doc:*)",
+      "Bash(pg_isready:*)",
+      "Bash(cargo search:*)",
+      "Bash(RUSTFLAGS=\"-Z macro-backtrace\" cargo build:*)",
+      "Bash(tee:*)"
     ]
   }
 }

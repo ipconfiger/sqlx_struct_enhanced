@@ -12,9 +12,13 @@ proc-macro = true
 # No default feature - must be explicitly selected via parent crate
 postgres = []
 mysql = []
+mysql_5_7 = ["mysql"]  # MySQL 5.7 compatibility (no INCLUDE support)
 sqlite = []
+join_queries = []
+log_sql = []  # Enable SQL logging for debugging
 
 [dependencies]
 syn = { version = "1.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0.51"
+# sqlparser = "0.60"  # Temporarily disabled for architecture validation

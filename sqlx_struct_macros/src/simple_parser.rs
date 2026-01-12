@@ -577,6 +577,36 @@ impl SimpleSqlParser {
     }
 }
 
+// ==================== Phase B.3: Subquery Types ====================
+
+/// 子查询信息
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubqueryInfo {
+    /// 子查询的 SQL
+    pub sql: String,
+    /// 子查询类型（WHERE、FROM、EXISTS）
+    pub subquery_type: SubqueryType,
+    /// 子查询中需要索引的列
+    pub columns: Vec<String>,
+    /// 子查询的表名（如果能推断出来）
+    pub table_name: Option<String>,
+}
+
+/// 子查询类型
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubqueryType {
+    /// WHERE 子查询: WHERE id IN (SELECT ...)
+    WhereIn,
+    /// WHERE 子查询: WHERE id = (SELECT ...)
+    WhereEquals,
+    /// FROM 子查询: FROM (SELECT ...) AS alias
+    From,
+    /// EXISTS 子查询: WHERE EXISTS (SELECT ...)
+    Exists,
+    /// NOT EXISTS 子查询
+    NotExists,
+}
+
 /// Day 4: 查询复杂度信息
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryComplexity {
@@ -829,7 +859,7 @@ impl SimpleSqlParser {
     }
 
     /// Day 5: 判断是否应该创建部分索引
-    fn should_be_partial_index(&self, sql: &str) -> bool {
+    pub fn should_be_partial_index(&self, sql: &str) -> bool {
         let sql_lower = sql.to_lowercase();
 
         // 检查是否有特定的部分索引模式
@@ -858,7 +888,9 @@ impl SimpleSqlParser {
     }
 
     /// Day 5: 提取部分索引的条件
-    fn extract_partial_condition(&self, sql: &str) -> Option<String> {
+    ///
+    /// 优先提取字面量条件（如 status = 'active'）而非参数化条件（如 user_id = $1）
+    pub fn extract_partial_condition(&self, sql: &str) -> Option<String> {
         // 只在确实是部分索引时才提取
         if !self.should_be_partial_index(sql) {
             return None;
@@ -873,7 +905,40 @@ impl SimpleSqlParser {
             let where_end = self.find_clause_end(after_where);
             let where_clause = &after_where[..where_end];
 
-            // 提取第一个简单条件
+            // 优先提取软删除模式: deleted_at IS NULL
+            if where_clause.contains("deleted_at IS NULL") || where_clause.contains("deleted_at is null") {
+                if let Some(and_pos) = where_clause.find(" AND ") {
+                    let condition = where_clause[..and_pos].trim();
+                    if condition.contains("deleted_at") {
+                        return Some(condition.to_string());
+                    }
+                } else if let Some(and_pos) = where_clause.find(" and ") {
+                    let condition = where_clause[..and_pos].trim();
+                    if condition.contains("deleted_at") {
+                        return Some(condition.to_string());
+                    }
+                } else {
+                    // 只有单个条件
+                    for line in where_clause.lines() {
+                        let line = line.trim();
+                        if line.contains("deleted_at") {
+                            return Some(line.to_string());
+                        }
+                    }
+                }
+            }
+
+            // 提取状态字面量条件: status = 'literal'
+            // 查找所有包含 ' 的条件（字面量）
+            for part in where_clause.split(" AND ").chain(where_clause.split(" and ")) {
+                let part = part.trim();
+                // 检查是否包含单引号（字面量）
+                if part.contains("'") && (part.contains("status = '") || part.contains("type = '")) {
+                    return Some(part.to_string());
+                }
+            }
+
+            // 如果没有找到字面量条件，返回第一个条件（原始行为）
             if let Some(and_pos) = where_clause.find(" AND ") {
                 Some(where_clause[..and_pos].trim().to_string())
             } else if let Some(and_pos) = where_clause.find(" and ") {
@@ -890,7 +955,7 @@ impl SimpleSqlParser {
     /// Day 5: 检测 INCLUDE 列（覆盖索引）
     ///
     /// 检测 SELECT 中的列，这些列不在 WHERE/ORDER BY 中但可以包含在索引中以避免表查找
-    fn detect_include_columns(&self, sql: &str, index_columns: &[String]) -> Vec<String> {
+    pub fn detect_include_columns(&self, sql: &str, index_columns: &[String]) -> Vec<String> {
         let mut include_cols = Vec::new();
 
         // 提取 SELECT 中的列
@@ -1666,6 +1731,212 @@ impl SimpleSqlParser {
             format!("Moderate ({:.0} vs full scan)", base_cost)
         } else {
             format!("High ({:.0} vs full scan)", base_cost)
+        }
+    }
+
+    // ==================== Phase B.3: Subquery Analysis ====================
+
+    /// 提取 SQL 中的所有子查询
+    ///
+    /// 返回子查询信息列表，包括子查询的 SQL 和类型
+    pub fn extract_subqueries(&self, sql: &str) -> Vec<SubqueryInfo> {
+        let mut subqueries = Vec::new();
+
+        // 1. 检测 WHERE 子查询
+        subqueries.extend(self.extract_where_subqueries(sql));
+
+        // 2. 检测 FROM 子查询
+        subqueries.extend(self.extract_from_subqueries(sql));
+
+        // 3. 检测 EXISTS/NOT EXISTS 子查询
+        subqueries.extend(self.extract_exists_subqueries(sql));
+
+        subqueries
+    }
+
+    /// 检测 WHERE 子句中的子查询
+    fn extract_where_subqueries(&self, sql: &str) -> Vec<SubqueryInfo> {
+        let mut subqueries = Vec::new();
+        let sql_lower = sql.to_lowercase();
+
+        // 查找 WHERE 子句
+        if let Some(where_pos) = sql_lower.find("where") {
+            let after_where = &sql[where_pos + 5..];
+            let where_end = self.find_clause_end(after_where);
+            let where_clause = &after_where[..where_end];
+
+            // 检测 IN (SELECT ...) 模式
+            if let Some(in_pos) = where_clause.find(" IN (") {
+                if let Some(select_start) = where_clause[in_pos + 4..].find("SELECT") {
+                    let subquery_start = in_pos + 4 + select_start;
+                    let subquery_sql = self.extract_subquery_sql(&where_clause[subquery_start..]);
+
+                    if let Some(sq) = subquery_sql {
+                        // 分析子查询中的列
+                        let columns = self.analyze_subquery_columns(&sq);
+
+                        subqueries.push(SubqueryInfo {
+                            sql: sq,
+                            subquery_type: SubqueryType::WhereIn,
+                            columns,
+                            table_name: None, // 无法从子查询推断表名
+                        });
+                    }
+                }
+            }
+
+            // 检测 = (SELECT ...) 模式
+            if let Some(eq_pos) = where_clause.find(" = (") {
+                if let Some(select_start) = where_clause[eq_pos + 3..].find("SELECT") {
+                    let subquery_start = eq_pos + 3 + select_start;
+                    let subquery_sql = self.extract_subquery_sql(&where_clause[subquery_start..]);
+
+                    if let Some(sq) = subquery_sql {
+                        let columns = self.analyze_subquery_columns(&sq);
+
+                        subqueries.push(SubqueryInfo {
+                            sql: sq,
+                            subquery_type: SubqueryType::WhereEquals,
+                            columns,
+                            table_name: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        subqueries
+    }
+
+    /// 检测 FROM 子句中的子查询
+    fn extract_from_subqueries(&self, sql: &str) -> Vec<SubqueryInfo> {
+        let mut subqueries = Vec::new();
+        let sql_lower = sql.to_lowercase();
+
+        // 查找 FROM 子句
+        if let Some(from_pos) = sql_lower.find("from") {
+            let after_from = &sql[from_pos + 4..];
+            let from_end = self.find_clause_end(after_from);
+            let from_clause = &after_from[..from_end];
+
+            // 检测 FROM (SELECT ...) AS alias 模式
+            if let Some(open_paren) = from_clause.find("(") {
+                // 查找匹配的右括号
+                let mut paren_count = 1;
+                let mut close_paren_pos = open_paren + 1;
+
+                for ch in from_clause[open_paren + 1..].chars() {
+                    if ch == '(' {
+                        paren_count += 1;
+                    } else if ch == ')' {
+                        paren_count -= 1;
+                        if paren_count == 0 {
+                            break;
+                        }
+                    }
+                    close_paren_pos += 1;
+                }
+
+                // 检查括号内是否包含 SELECT
+                let sub_part = &from_clause[open_paren..close_paren_pos];
+                if sub_part.to_lowercase().contains("select") {
+                    let subquery_sql = sub_part.trim().to_string();
+                    let columns = self.analyze_subquery_columns(&subquery_sql);
+
+                    subqueries.push(SubqueryInfo {
+                        sql: subquery_sql,
+                        subquery_type: SubqueryType::From,
+                        columns,
+                        table_name: None,
+                    });
+                }
+            }
+        }
+
+        subqueries
+    }
+
+    /// 检测 EXISTS/NOT EXISTS 子查询
+    fn extract_exists_subqueries(&self, sql: &str) -> Vec<SubqueryInfo> {
+        let mut subqueries = Vec::new();
+        let sql_lower = sql.to_lowercase();
+
+        // 检测 WHERE EXISTS (SELECT ...)
+        if sql_lower.contains("where exists (") {
+            if let Some(exists_pos) = sql_lower.find("where exists (") {
+                let after_exists = &sql[exists_pos + 13..];
+                if let Some(subquery_sql) = self.extract_subquery_sql(after_exists) {
+                    let columns = self.analyze_subquery_columns(&subquery_sql);
+
+                    subqueries.push(SubqueryInfo {
+                        sql: subquery_sql.clone(),
+                        subquery_type: SubqueryType::Exists,
+                        columns,
+                        table_name: None,
+                    });
+                }
+            }
+        }
+
+        // 检测 WHERE NOT EXISTS (SELECT ...)
+        if sql_lower.contains("where not exists (") {
+            if let Some(exists_pos) = sql_lower.find("where not exists (") {
+                let after_exists = &sql[exists_pos + 17..];
+                if let Some(subquery_sql) = self.extract_subquery_sql(after_exists) {
+                    let columns = self.analyze_subquery_columns(&subquery_sql);
+
+                    subqueries.push(SubqueryInfo {
+                        sql: subquery_sql.clone(),
+                        subquery_type: SubqueryType::NotExists,
+                        columns,
+                        table_name: None,
+                    });
+                }
+            }
+        }
+
+        subqueries
+    }
+
+    /// 从文本中提取子查询 SQL
+    fn extract_subquery_sql(&self, text: &str) -> Option<String> {
+        let text = text.trim();
+
+        // 查找 SELECT 的开始
+        let select_pos = text.to_lowercase().find("select")?;
+        let _from_pos = text.to_lowercase()[select_pos..].find("from")?;
+
+        // 提取从 SELECT 到 FROM 之前（简单版本）
+        // 更完整的版本需要处理括号匹配
+        let mut paren_count = 0;
+        let mut end_pos = select_pos;
+
+        for (i, ch) in text[select_pos..].char_indices() {
+            if ch == '(' {
+                paren_count += 1;
+            } else if ch == ')' {
+                if paren_count == 0 {
+                    end_pos = select_pos + i;
+                    break;
+                }
+                paren_count -= 1;
+            }
+        }
+
+        Some(text[..end_pos].trim().to_string())
+    }
+
+    /// 分析子查询中的列
+    fn analyze_subquery_columns(&self, subquery_sql: &str) -> Vec<String> {
+        // 使用现有的 extract_index_columns 方法分析子查询
+        // 但只返回 WHERE 条件中的列（不包括 ORDER BY）
+        let columns = self.extract_index_columns(subquery_sql);
+
+        // 简化：只返回前几个关键列
+        if columns.len() > 3 {
+            columns[..3].to_vec()
+        } else {
+            columns
         }
     }
 }

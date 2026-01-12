@@ -5,9 +5,11 @@ use sqlx::database::HasArguments;
 use sqlx::postgres::Postgres;
 
 #[cfg(feature = "mysql")]
+#[allow(unused_imports)]  // May be unused when multiple features are enabled
 use sqlx::mysql::MySql;
 
 #[cfg(feature = "sqlite")]
+#[allow(unused_imports)]  // May be unused when multiple features are enabled
 use sqlx::sqlite::Sqlite;
 
 // Re-export the concrete proxy types for PostgreSQL
@@ -38,6 +40,78 @@ pub trait EnhancedCrud {
     fn bulk_update(items: &[Self]) -> Query<'_, Postgres, <Postgres as HasArguments<'_>>::Arguments> where Self: Sized;
     fn bulk_select(ids: &[String]) -> QueryAs<'_, Postgres, Self, <Postgres as HasArguments<'_>>::Arguments> where Self: Sized;
     fn agg_query() -> crate::aggregate::AggQueryBuilder<'static, Postgres> where Self: Sized;
+
+    /// Start an INNER JOIN with another table, returning a query builder.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `T` - The other entity type to join with (must implement EnhancedCrud)
+    ///
+    /// # Returns
+    ///
+    /// A `JoinQueryBuilder` that can be used to execute the query.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use sqlx_struct_enhanced::{EnhancedCrud, join::JoinTuple2};
+    ///
+    /// let results: Vec<JoinTuple2<Order, Customer>> = Order::join_inner::<Customer>(
+    ///     "orders.customer_id = customers.id"
+    /// )
+    /// .fetch_all(&pool)
+    /// .await?;
+    /// ```
+    #[cfg(feature = "join_queries")]
+    fn join_inner<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, Postgres>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
+
+    /// Start a LEFT JOIN with another table.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results = Order::join_left::<Customer>("orders.customer_id = customers.id")
+    ///     .fetch_all(&pool)
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "join_queries")]
+    fn join_left<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, Postgres>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
+
+    /// Start a RIGHT JOIN with another table.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results = Order::join_right::<Customer>("orders.customer_id = customers.id")
+    ///     .fetch_all(&pool)
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "join_queries")]
+    fn join_right<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, Postgres>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
+
+    /// Start a FULL JOIN with another table.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results = Order::join_full::<Customer>("orders.customer_id = customers.id")
+    ///     .fetch_all(&pool)
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "join_queries")]
+    fn join_full<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, Postgres>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
 }
 
 #[cfg(all(feature = "mysql", not(feature = "postgres"), not(feature = "sqlite")))]
@@ -56,6 +130,38 @@ pub trait EnhancedCrud {
     fn bulk_update(items: &[Self]) -> Query<'_, MySql, <MySql as HasArguments<'_>>::Arguments> where Self: Sized;
     fn bulk_select(ids: &[String]) -> QueryAs<'_, MySql, Self, <MySql as HasArguments<'_>>::Arguments> where Self: Sized;
     fn agg_query() -> crate::aggregate::AggQueryBuilder<'static, MySql> where Self: Sized;
+
+    /// Start an INNER JOIN with another table.
+    #[cfg(feature = "join_queries")]
+    fn join_inner<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, MySql>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
+
+    /// Start a LEFT JOIN with another table.
+    #[cfg(feature = "join_queries")]
+    fn join_left<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, MySql>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
+
+    /// Start a RIGHT JOIN with another table.
+    #[cfg(feature = "join_queries")]
+    fn join_right<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, MySql>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
+
+    /// Start a FULL JOIN with another table.
+    ///
+    /// Note: MySQL does not support FULL JOIN natively.
+    /// This method is provided for API compatibility but will generate
+    /// invalid SQL. Use LEFT JOIN UNION RIGHT JOIN pattern instead.
+    #[cfg(feature = "join_queries")]
+    fn join_full<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, MySql>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
 }
 
 #[cfg(all(feature = "sqlite", not(feature = "postgres"), not(feature = "mysql")))]
@@ -74,6 +180,42 @@ pub trait EnhancedCrud {
     fn bulk_update(items: &[Self]) -> Query<'_, Sqlite, <Sqlite as HasArguments<'_>>::Arguments> where Self: Sized;
     fn bulk_select(ids: &[String]) -> QueryAs<'_, Sqlite, Self, <Sqlite as HasArguments<'_>>::Arguments> where Self: Sized;
     fn agg_query() -> crate::aggregate::AggQueryBuilder<'static, Sqlite> where Self: Sized;
+
+    /// Start an INNER JOIN with another table.
+    #[cfg(feature = "join_queries")]
+    fn join_inner<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, Sqlite>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
+
+    /// Start a LEFT JOIN with another table.
+    #[cfg(feature = "join_queries")]
+    fn join_left<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, Sqlite>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
+
+    /// Start a RIGHT JOIN with another table.
+    ///
+    /// Note: SQLite does not support RIGHT JOIN natively.
+    /// This method is provided for API compatibility but will generate
+    /// invalid SQL. Use LEFT JOIN with reversed table order instead.
+    #[cfg(feature = "join_queries")]
+    fn join_right<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, Sqlite>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
+
+    /// Start a FULL JOIN with another table.
+    ///
+    /// Note: SQLite does not support FULL JOIN natively.
+    /// This method is provided for API compatibility but will generate
+    /// invalid SQL. Use LEFT JOIN UNION LEFT JOIN pattern instead.
+    #[cfg(feature = "join_queries")]
+    fn join_full<T>(condition: &str) -> crate::join::JoinQueryBuilder<'static, Self, T, Sqlite>
+    where
+        Self: Sized + crate::join::SchemeAccessor,
+        T: Sized + crate::join::SchemeAccessor + Unpin + Send;
 }
 
 // ============================================================================

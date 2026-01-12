@@ -3,7 +3,16 @@
 //! This module provides automatic schema comparison and migration generation
 //! by comparing database metadata with Rust struct definitions.
 
-use sqlx::{Pool, Postgres, FromRow, Row as _};
+use sqlx::{Pool, FromRow, Row as _};
+
+#[cfg(feature = "postgres")]
+use sqlx::Postgres;
+
+#[cfg(feature = "mysql")]
+use sqlx::MySql;
+
+#[cfg(feature = "sqlite")]
+use sqlx::Sqlite;
 
 // ============================================================================
 // Core Types
@@ -215,8 +224,39 @@ pub struct MigrationRecord {
     pub execution_time_ms: i64,
 }
 
+#[cfg(feature = "postgres")]
 impl<'r> FromRow<'r, sqlx::postgres::PgRow> for MigrationRecord {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row as _;
+
+        Ok(Self {
+            version: row.try_get("version")?,
+            name: row.try_get("name")?,
+            checksum: row.try_get("checksum")?,
+            applied_at: row.try_get("applied_at")?,
+            execution_time_ms: row.try_get("execution_time_ms")?,
+        })
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl<'r> FromRow<'r, sqlx::mysql::MySqlRow> for MigrationRecord {
+    fn from_row(row: &'r sqlx::mysql::MySqlRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row as _;
+
+        Ok(Self {
+            version: row.try_get("version")?,
+            name: row.try_get("name")?,
+            checksum: row.try_get("checksum")?,
+            applied_at: row.try_get("applied_at")?,
+            execution_time_ms: row.try_get("execution_time_ms")?,
+        })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for MigrationRecord {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row as _;
 
         Ok(Self {
@@ -629,7 +669,7 @@ impl SchemaComparator {
         }
 
         // 3. Detect removed tables (in DB but not in struct)
-        for (table_name, db_table) in &db_tables {
+        for (table_name, _db_table) in &db_tables {
             if processed_db_tables.contains(table_name) {
                 continue;
             }
