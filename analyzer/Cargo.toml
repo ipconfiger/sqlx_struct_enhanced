@@ -1,0 +1,25 @@
+[workspace]
+# Empty workspace to exclude from parent workspace
+
+[package]
+name = "sqlx-analyzer"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone tool to analyze queries and generate index recommendations"
+
+[[bin]]
+name = "sqlx-analyzer"
+path = "src/main.rs"
+
+[features]
+default = []
+# Dummy features for compatibility when this tool is used as a dependency
+# The analyzer itself doesn't use these, but projects may require them
+postgres = []
+mysql = []
+sqlite = []
+
+[dependencies]
+walkdir = "2.3"
+glob = "0.3"
+regex = "1.8"

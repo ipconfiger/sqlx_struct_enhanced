@@ -326,6 +326,82 @@ mod order_queries {
 - Indexes on join columns dramatically improve query performance
 - The analyzer detects INNER JOIN, LEFT JOIN, and RIGHT JOIN
 
+### Example 5b: JOIN with Subquery (Recursive Alias Resolution) 🆕🆕
+
+```rust
+#[analyze_queries]
+mod merchant_queries {
+    #[derive(EnhancedCrud)]
+    struct Merchant {
+        merchant_id: String,
+        city_id: String,
+        channel_id: String,
+        audit_status: i32,
+    }
+
+    impl Merchant {
+        fn find_merchants_with_coupons(city_id: &str, channel_id: &str) {
+            Merchant::make_query(
+                "SELECT m.* FROM [Self] AS m
+                 JOIN merchant_channel AS mc ON mc.merchant_id = m.merchant_id
+                 WHERE m.merchant_id in (
+                     SELECT m1.merchant_id FROM merchant_coupon_type as m1
+                     JOIN coupon_type as c ON m1.coupon_type_id = c.coupon_type_id
+                     GROUP BY m1.merchant_id
+                     ORDER BY MAX(c.ts) DESC LIMIT 20
+                 )
+                 AND m.city_id = $1 AND m.audit_status > 0 AND mc.channel_id = $2
+                 ORDER BY ts DESC"
+            ).fetch_all(pool)
+        }
+    }
+}
+```
+
+**Recommendations:**
+```
+✨ Recommended: idx_merchant_merchant_id_city_id_audit_status_ts
+   Table: merchant
+   Columns: merchant_id, city_id, audit_status, ts
+   Reason: ON/WHERE/ORDER BY in JOIN query
+
+✨ Recommended: idx_merchant_channel_merchant_id_channel_id
+   Table: merchant_channel
+   Columns: merchant_id, channel_id
+   Reason: ON/WHERE/ORDER BY in JOIN query
+
+✨ Recommended: idx_merchant_coupon_type_merchant_id
+   Table: merchant_coupon_type
+   Columns: merchant_id
+   Reason: ON/WHERE in JOIN query
+
+✨ Recommended: idx_coupon_type_coupon_type_id_ts
+   Table: coupon_type
+   Columns: coupon_type_id, ts
+   Reason: ON/WHERE/ORDER BY in JOIN query
+```
+
+**Why This Matters:**
+- The query contains **nested subqueries** with table aliases (`m1`, `c`)
+- The analyzer **recursively extracts aliases** from all levels
+- Generates indexes on **actual table names** (`merchant_coupon_type`, `coupon_type`)
+- **NOT on aliases** (`m1`, `c`) - which would cause "relation does not exist" errors!
+
+**Alias Resolution Process:**
+```
+Main query:
+  m → merchant
+  mc → merchant_channel
+
+Subquery (recursive extraction):
+  m1 → merchant_coupon_type
+  c → coupon_type
+
+Result: All 4 tables get correct index recommendations
+```
+
+This feature ensures that complex JOIN queries with subqueries generate correct, executable SQL.
+
 ### Example 6: GROUP BY Query Analysis 🆕
 
 ```rust
@@ -1423,7 +1499,10 @@ mod experimental_queries {
 
 ### What's Not Supported Yet
 
-- ❌ Subquery column analysis (detects subqueries but doesn't analyze internal queries)
+- ✅ **Subquery alias extraction** - NOW SUPPORTED! (January 2025) 🆕
+  - Recursively extracts aliases from all nesting levels
+  - Correctly resolves subquery aliases to actual table names
+  - Works for both standalone analyzer and compile-time analyzer
 - ❌ Covering indexes (INCLUDE columns)
 - ❌ UNION queries
 - ❌ Window functions
@@ -1561,6 +1640,33 @@ Equality > IN > Range > LIKE > Inequality > NOT LIKE > ORDER BY
 - Updated `compile_time_analyzer.rs` with JOIN and GROUP BY analysis logic
 - Added test suite: `tests/join_groupby_analysis_test.rs`
 - Created implementation summary: `JOIN_GROUPBY_IMPLEMENTATION_SUMMARY.md`
+
+### ✅ Phase B.1: Recursive Subquery Alias Extraction (Completed) 🆕🆕
+
+- ✅ Recursive alias extraction from all nesting levels
+- ✅ Subquery table alias resolution
+- ✅ Qualified column name parsing in GROUP BY
+- ✅ Synchronized fix to both standalone and compile-time analyzers
+- ✅ Comprehensive test suite (4 new unit tests, all passing)
+- ✅ Documentation updated with subquery examples
+
+**Implementation Details** (Phase B.1):
+- Updated `analyzer/src/join_analysis_tests.rs`:
+  - Made `TableAliasMap.aliases` field public
+  - Added recursive subquery processing in `extract_table_aliases()`
+  - Now calls `extract_subqueries_from_sql()` and recursively processes each subquery
+  - Merges all aliases from main query and all subqueries
+- Updated `sqlx_struct_macros/src/compile_time_analyzer.rs`:
+  - Added `TableAliasMap` struct (same as standalone analyzer)
+  - Added `extract_table_aliases()` with recursive subquery support
+  - Added `extract_subqueries_from_sql()` function
+  - Updated `is_current_table_column()` to use alias resolution
+  - Updated JOIN index generation to resolve aliases
+  - Updated GROUP BY index generation to handle qualified column names
+- Created test example: `examples/test_join_subquery_analysis.rs`
+- Updated implementation summary: `JOIN_ANALYSIS_IMPLEMENTATION_SUMMARY.md`
+
+**Key Fix**: Before this change, subquery aliases like `m1`, `c`, `uc` would cause "relation does not exist" errors. Now all aliases are recursively extracted and resolved to actual table names.
 
 ### Phase 0: Days 5-6 (Advanced Analysis)
 

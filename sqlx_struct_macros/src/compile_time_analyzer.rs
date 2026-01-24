@@ -7,6 +7,250 @@ use crate::query_extractor::{QueryExtractor, ExtractedQuery};
 use crate::simple_parser::SimpleSqlParser;
 use crate::parser::{SqlParser, SqlDialect, IndexSyntax};
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+
+/// Maps table aliases to actual table names
+struct TableAliasMap {
+    aliases: HashMap<String, String>,
+}
+
+impl TableAliasMap {
+    fn new() -> Self {
+        Self {
+            aliases: HashMap::new(),
+        }
+    }
+
+    fn add_alias(&mut self, alias: String, table: String) {
+        self.aliases.insert(alias, table);
+    }
+
+    /// Resolve an alias or table reference to the actual table name
+    fn resolve(&self, alias_or_table: &str) -> String {
+        if let Some(table) = self.aliases.get(alias_or_table) {
+            table.clone()
+        } else {
+            alias_or_table.to_string()
+        }
+    }
+}
+
+/// Extract table name and alias mappings from FROM and JOIN clauses
+/// Recursively extracts aliases from ALL levels of queries, including nested subqueries
+fn extract_table_aliases(sql: &str) -> TableAliasMap {
+    let mut map = TableAliasMap::new();
+    let sql_lower = sql.to_lowercase();
+
+    // Extract FROM clause (main query)
+    if let Some(from_pos) = sql_lower.find("from") {
+        let from_end = find_from_end(&sql_lower[from_pos..]);
+        if from_end > 0 {
+            let from_clause = &sql[from_pos + 4..from_pos + from_end];
+            parse_table_clause(from_clause, &mut map);
+        }
+    }
+
+    // Extract JOIN clauses (main query)
+    let join_keywords = ["inner join", "left join", "right join", "join"];
+    for keyword in &join_keywords {
+        let mut search_start = 0;
+        while let Some(join_pos) = sql_lower[search_start..].find(keyword) {
+            let actual_pos = search_start + join_pos;
+            let keyword_len = keyword.len();
+
+            let join_start = actual_pos + keyword_len;
+            let join_end = find_join_end(&sql_lower[join_start..]);
+            if join_end > 0 {
+                let join_clause = &sql[join_start..join_start + join_end];
+                parse_table_clause(join_clause, &mut map);
+            }
+
+            search_start = actual_pos + keyword_len;
+        }
+    }
+
+    // Recursively extract aliases FROM SUBQUERIES
+    let (_, subqueries) = extract_subqueries_from_sql(sql);
+    for subquery_sql in subqueries {
+        let subquery_aliases = extract_table_aliases(&subquery_sql);
+        for (alias, table) in subquery_aliases.aliases.iter() {
+            map.add_alias(alias.clone(), table.clone());
+        }
+    }
+
+    map
+}
+
+/// Find the end of a FROM clause
+fn find_from_end(clause: &str) -> usize {
+    let keywords = ["where", "order by", "group by", "having", "limit"];
+    let mut min_pos = clause.len();
+
+    for keyword in &keywords {
+        if let Some(pos) = clause.find(keyword) {
+            min_pos = min_pos.min(pos);
+        }
+    }
+
+    min_pos
+}
+
+/// Find the end of a JOIN clause
+fn find_join_end(clause: &str) -> usize {
+    let keywords = ["where", "order by", "group by", "inner join", "left join", "right join", "join"];
+    let mut min_pos = clause.len();
+
+    for keyword in &keywords {
+        if let Some(pos) = clause.find(keyword) {
+            min_pos = min_pos.min(pos);
+        }
+    }
+
+    min_pos
+}
+
+/// Parse a table clause (FROM or JOIN) to extract table name and alias
+fn parse_table_clause(clause: &str, map: &mut TableAliasMap) {
+    let trimmed = clause.trim();
+
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+
+    if parts.is_empty() {
+        return;
+    }
+
+    let table_name = parts[0].trim();
+
+    if parts.len() == 1 {
+        map.add_alias(table_name.to_string(), table_name.to_string());
+    } else if parts.len() >= 2 {
+        let second = parts[1].trim().to_uppercase();
+
+        if second == "AS" && parts.len() >= 3 {
+            let alias = parts[2].trim();
+            map.add_alias(alias.to_string(), table_name.to_string());
+        } else if second != "ON" && second != "WHERE" && second != "," {
+            map.add_alias(second.to_lowercase(), table_name.to_string());
+        } else {
+            map.add_alias(table_name.to_string(), table_name.to_string());
+        }
+    }
+}
+
+/// Remove subqueries from SQL and return both cleaned SQL and list of subqueries
+fn extract_subqueries_from_sql(sql: &str) -> (String, Vec<String>) {
+    let mut result = String::new();
+    let mut subqueries = Vec::new();
+    let mut depth = 0;
+    let mut in_subquery = false;
+    let mut subquery_start = 0;
+
+    for (i, c) in sql.chars().enumerate() {
+        if c == '(' {
+            depth += 1;
+            if depth == 1 && !in_subquery {
+                let after_paren = &sql[i+1..].to_uppercase();
+                if after_paren.trim().starts_with("SELECT") {
+                    in_subquery = true;
+                    subquery_start = i + 1;
+                    continue;
+                }
+            }
+        } else if c == ')' {
+            if depth > 0 {
+                depth -= 1;
+                if in_subquery && depth == 0 {
+                    in_subquery = false;
+                    let subquery_sql = &sql[subquery_start..i].trim();
+                    subqueries.push(subquery_sql.to_string());
+                    result.push_str("($1)");
+                    continue;
+                }
+            }
+        }
+
+        if !in_subquery {
+            result.push(c);
+        }
+    }
+
+    (result, subqueries)
+}
+
+/// 索引信息
+#[derive(Debug, Clone)]
+struct IndexInfo {
+    name: String,
+    table_name: String,
+    columns: Vec<String>,
+    include_columns: Vec<String>,
+    partial_condition: Option<String>,
+    reason: String,
+}
+
+impl IndexInfo {
+    /// 生成 CREATE INDEX 语句
+    fn to_create_sql(&self, dialect: SqlDialect) -> String {
+        let columns_str = self.columns.join(", ");
+        let mut sql = format!("CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+            self.name, self.table_name, columns_str);
+
+        // 处理 INCLUDE 子句（PostgreSQL 和 MySQL 8.0+）
+        if !self.include_columns.is_empty() {
+            match dialect {
+                SqlDialect::Postgres => {
+                    sql.push_str(&format!(" INCLUDE ({})",
+                        self.include_columns.join(", ")));
+                }
+                SqlDialect::MySQL => {
+                    sql.push_str(&format!(" INCLUDE ({})",
+                        self.include_columns.join(", ")));
+                }
+                SqlDialect::SQLite => {
+                    // SQLite 不支持 INCLUDE，添加注释
+                    sql.push_str(&format!(" -- INCLUDE not supported (consider adding: {})",
+                        self.include_columns.join(", ")));
+                }
+            }
+        }
+
+        // 处理部分索引的 WHERE 子句
+        if let Some(ref condition) = self.partial_condition {
+            match dialect {
+                SqlDialect::Postgres | SqlDialect::SQLite => {
+                    sql.push_str(&format!(" WHERE {}", condition));
+                }
+                SqlDialect::MySQL => {
+                    // MySQL 不支持部分索引，添加注释
+                    sql.push_str(&format!(" -- Partial indexes not supported (WHERE {})",
+                        condition));
+                }
+            }
+        }
+
+        sql
+    }
+
+    /// 生成 DROP INDEX 语句
+    fn to_drop_sql(&self, dialect: SqlDialect) -> String {
+        match dialect {
+            SqlDialect::Postgres => {
+                format!("DROP INDEX IF EXISTS {}", self.name)
+            }
+            SqlDialect::MySQL => {
+                format!("DROP INDEX IF EXISTS {} ON {}", self.name, self.table_name)
+            }
+            SqlDialect::SQLite => {
+                format!("DROP INDEX IF EXISTS {}", self.name)
+            }
+        }
+    }
+}
 
 /// 检测当前启用的数据库方言
 ///
@@ -114,15 +358,15 @@ pub fn analyze_queries(_attr: TokenStream, input: TokenStream) -> TokenStream {
         return input;
     }
 
-    // 分析并打印推荐
-    print_recommendations(&queries);
+    // 分析、打印并保存推荐
+    print_and_save_recommendations(&queries);
 
     // 返回原代码，不做修改
     input
 }
 
-/// 打印索引推荐
-fn print_recommendations(queries: &[ExtractedQuery]) {
+/// 打印索引推荐并保存到 SQL 文件
+fn print_and_save_recommendations(queries: &[ExtractedQuery]) {
     println!();
     println!("🔍 ======================================================");
     println!("🔍   SQLx Struct - Index Recommendations");
@@ -133,6 +377,9 @@ fn print_recommendations(queries: &[ExtractedQuery]) {
     let dialect = detect_dialect();
     let mysql_version = detect_mysql_version();
     let syntax = IndexSyntax::for_dialect(dialect);
+
+    // 收集所有索引推荐用于保存到文件
+    let mut all_indexes: Vec<IndexInfo> = Vec::new();
 
     // 显示当前数据库方言
     println!("🗄️  Database: {}", format!("{:?}", dialect));
@@ -215,20 +462,30 @@ fn print_recommendations(queries: &[ExtractedQuery]) {
 
                         println!("      Reason: {}", explain_reason(&index_cols, query));
 
-                        // 生成 SQL 语句（根据数据库方言）
+                        // 收集索引信息用于保存
+                        all_indexes.push(IndexInfo {
+                            name: index_name.clone(),
+                            table_name: table_name.clone(),
+                            columns: index_cols.clone(),
+                            include_columns: include_columns.clone(),
+                            partial_condition: partial_condition.clone(),
+                            reason: explain_reason(&index_cols, query),
+                        });
+
+                        // 生成 SQL 语句（根据数据库方言，使用 IF NOT EXISTS）
                         match dialect {
                             SqlDialect::Postgres => {
                                 if !include_columns.is_empty() {
                                     // 覆盖索引 SQL
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({}) INCLUDE ({})",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({}) INCLUDE ({})",
                                         index_name, table_name, index_cols.join(", "), include_columns.join(", "));
                                 } else if let Some(ref condition) = partial_condition {
                                     // 部分索引 SQL
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({}) WHERE {}",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({}) WHERE {}",
                                         index_name, table_name, index_cols.join(", "), condition);
                                 } else {
                                     // 普通索引 SQL
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({})",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({})",
                                         index_name, table_name, index_cols.join(", "));
                                 }
                             },
@@ -238,19 +495,19 @@ fn print_recommendations(queries: &[ExtractedQuery]) {
 
                                 if !include_columns.is_empty() && supports_include {
                                     // MySQL 8.0+ 覆盖索引
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({}) INCLUDE ({})",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({}) INCLUDE ({})",
                                         index_name, table_name, index_cols.join(", "), include_columns.join(", "));
                                 } else if !include_columns.is_empty() && !supports_include {
                                     // MySQL 5.7：提示升级
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({}) -- INCLUDE requires MySQL 8.0+ (consider including: {})",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({}) -- INCLUDE requires MySQL 8.0+ (consider including: {})",
                                         index_name, table_name, index_cols.join(", "), include_columns.join(", "));
                                 } else if let Some(ref _condition) = partial_condition {
                                     // MySQL不支持部分索引，添加注释
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({}) -- Note: Partial indexes not supported, consider filtering in WHERE clause",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({}) -- Note: Partial indexes not supported, consider filtering in WHERE clause",
                                         index_name, table_name, index_cols.join(", "));
                                 } else {
                                     // 普通索引 SQL
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({})",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({})",
                                         index_name, table_name, index_cols.join(", "));
                                 }
                             },
@@ -258,15 +515,15 @@ fn print_recommendations(queries: &[ExtractedQuery]) {
                                 // SQLite不支持INCLUDE，但支持部分索引
                                 if !include_columns.is_empty() {
                                     // SQLite不支持INCLUDE，添加注释
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({}) -- Note: INCLUDE not supported, consider adding these columns to the index",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({}) -- Note: INCLUDE not supported, consider adding these columns to the index",
                                         index_name, table_name, index_cols.join(", "));
                                 } else if let Some(ref condition) = partial_condition {
                                     // SQLite支持部分索引
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({}) WHERE {}",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({}) WHERE {}",
                                         index_name, table_name, index_cols.join(", "), condition);
                                 } else {
                                     // 普通索引 SQL
-                                    println!("      SQL:    CREATE INDEX {} ON {} ({})",
+                                    println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({})",
                                         index_name, table_name, index_cols.join(", "));
                                 }
                             }
@@ -277,6 +534,9 @@ fn print_recommendations(queries: &[ExtractedQuery]) {
             }
 
             // 生成 JOIN 索引推荐
+            // 首先提取所有表别名（包括子查询中的别名）
+            let aliases = extract_table_aliases(&query.sql);
+
             for join in &joins {
                 if let Some(condition) = join.first_condition() {
                     // 从 JOIN 条件中提取列名
@@ -290,18 +550,34 @@ fn print_recommendations(queries: &[ExtractedQuery]) {
                                 let table_alias = parts[0];
                                 let column = parts[1];
 
+                                // 解析别名为实际表名
+                                let resolved_table = aliases.resolve(table_alias);
+
                                 // 检查是否是当前表的列
                                 if is_current_table_column(table_alias, &query.sql) {
                                     let index_key = format!("JOIN_{}", join_col);
                                     if !seen_indexes.contains(&index_key) {
                                         seen_indexes.insert(index_key.clone());
 
-                                        let index_name = format!("idx_{}_{}_join", table_name, column);
+                                        // 使用解析后的表名来生成索引名
+                                        let index_name = format!("idx_{}_{}_join", resolved_table, column);
+
+                                        // 收集索引信息
+                                        all_indexes.push(IndexInfo {
+                                            name: index_name.clone(),
+                                            table_name: resolved_table.clone(),
+                                            columns: vec![column.to_string()],
+                                            include_columns: vec![],
+                                            partial_condition: None,
+                                            reason: format!("JOIN column ({} ON {})", join.join_type, condition),
+                                        });
+
                                         println!("   ✨ Recommended: {}", index_name);
+                                        println!("      Table: {}", resolved_table);
                                         println!("      Columns: {}", column);
                                         println!("      Reason: JOIN column ({} ON {})", join.join_type, condition);
-                                        println!("      SQL:    CREATE INDEX {} ON {} ({})",
-                                            index_name, table_name, column);
+                                        println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+                                            index_name, resolved_table, column);
                                         println!();
                                     }
                                 }
@@ -315,21 +591,53 @@ fn print_recommendations(queries: &[ExtractedQuery]) {
             if let Some(group_by_info) = &group_by {
                 if group_by_info.has_columns() {
                     for column in &group_by_info.columns {
-                        let index_key = format!("GROUP_BY_{}", column);
+                        // Handle qualified column names (e.g., "m1.merchant_id" -> "merchant_id")
+                        let (column_name, resolved_table) = if column.contains('.') {
+                            let parts: Vec<&str> = column.split('.').collect();
+                            if parts.len() == 2 {
+                                let table_alias = parts[0];
+                                let col = parts[1];
+                                // Resolve the alias to actual table name
+                                let resolved = aliases.resolve(table_alias);
+                                (col.to_string(), resolved)
+                            } else {
+                                (column.clone(), table_name.clone())
+                            }
+                        } else {
+                            (column.clone(), table_name.clone())
+                        };
+
+                        let index_key = format!("GROUP_BY_{}_{}", resolved_table, column_name);
 
                         if !seen_indexes.contains(&index_key) {
                             seen_indexes.insert(index_key.clone());
 
-                            let index_name = format!("idx_{}_{}_group", table_name, column);
+                            let index_name = format!("idx_{}_{}_group", resolved_table, column_name);
+
+                            // 收集索引信息
+                            all_indexes.push(IndexInfo {
+                                name: index_name.clone(),
+                                table_name: resolved_table.clone(),
+                                columns: vec![column_name.clone()],
+                                include_columns: vec![],
+                                partial_condition: None,
+                                reason: format!("GROUP BY column{}", if group_by_info.has_having() {
+                                    " with HAVING clause"
+                                } else {
+                                    ""
+                                }),
+                            });
+
                             println!("   ✨ Recommended: {}", index_name);
-                            println!("      Columns: {}", column);
+                            println!("      Table: {}", resolved_table);
+                            println!("      Columns: {}", column_name);
                             println!("      Reason: GROUP BY column{}", if group_by_info.has_having() {
                                 format!(" with HAVING clause")
                             } else {
                                 String::new()
                             });
-                            println!("      SQL:    CREATE INDEX {} ON {} ({})",
-                                index_name, table_name, column);
+                            println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+                                index_name, resolved_table, column_name);
                             println!();
                         }
                     }
@@ -352,11 +660,21 @@ fn print_recommendations(queries: &[ExtractedQuery]) {
                             let subquery_type_name = format!("{:?}", subquery.subquery_type);
                             let index_name = format!("idx_{}_subquery_{}", table_name, subquery.columns.join("_"));
 
+                            // 收集索引信息
+                            all_indexes.push(IndexInfo {
+                                name: index_name.clone(),
+                                table_name: table_name.clone(),
+                                columns: subquery.columns.clone(),
+                                include_columns: vec![],
+                                partial_condition: None,
+                                reason: "Index columns in subquery for better performance".to_string(),
+                            });
+
                             println!("   ✨ Recommended: {} (Subquery)", index_name);
                             println!("      Type: {} Subquery", subquery_type_name);
                             println!("      Columns: {}", subquery.columns.join(", "));
                             println!("      Reason: Index columns in subquery for better performance");
-                            println!("      SQL:    CREATE INDEX {} ON {} ({})",
+                            println!("      SQL:    CREATE INDEX IF NOT EXISTS {} ON {} ({})",
                                 index_name, table_name, subquery.columns.join(", "));
 
                             // 显示子查询的 SQL（格式化后）
@@ -374,6 +692,111 @@ fn print_recommendations(queries: &[ExtractedQuery]) {
     println!("🔍   End of Recommendations");
     println!("🔍 ======================================================");
     println!();
+
+    // 保存索引推荐到 SQL 文件
+    save_indexes_to_file(&all_indexes, dialect);
+}
+
+/// 保存索引推荐到 SQL 文件
+fn save_indexes_to_file(indexes: &[IndexInfo], dialect: SqlDialect) {
+    if indexes.is_empty() {
+        return;
+    }
+
+    // 创建输出目录
+    let output_dir = Path::new("target/sqlx_struct_indexes");
+    if let Err(e) = fs::create_dir_all(output_dir) {
+        println!("   ⚠️  Warning: Could not create output directory: {}", e);
+        return;
+    }
+
+    // 根据数据库方言确定文件名
+    let db_name = match dialect {
+        SqlDialect::Postgres => "postgres",
+        SqlDialect::MySQL => "mysql",
+        SqlDialect::SQLite => "sqlite",
+    };
+
+    // 生成 CREATE INDEX 文件
+    let create_file = output_dir.join(format!("indexes_{}.sql", db_name));
+    let create_content = generate_create_indexes_sql(indexes, dialect);
+    if let Err(e) = fs::write(&create_file, create_content) {
+        println!("   ⚠️  Warning: Could not write CREATE INDEX file: {}", e);
+    } else {
+        println!("   💾 Saved: {}", create_file.display());
+    }
+
+    // 生成 DROP INDEX 文件（用于回滚）
+    let drop_file = output_dir.join(format!("drop_indexes_{}.sql", db_name));
+    let drop_content = generate_drop_indexes_sql(indexes, dialect);
+    if let Err(e) = fs::write(&drop_file, drop_content) {
+        println!("   ⚠️  Warning: Could not write DROP INDEX file: {}", e);
+    } else {
+        println!("   💾 Saved: {}", drop_file.display());
+    }
+}
+
+/// 生成 CREATE INDEX SQL 文件内容
+fn generate_create_indexes_sql(indexes: &[IndexInfo], dialect: SqlDialect) -> String {
+    let mut content = String::new();
+
+    content.push_str("-- Auto-generated by sqlx_struct_enhanced\n");
+    content.push_str(&format!("-- Database: {:?}\n", dialect));
+    content.push_str("-- This file contains recommended indexes based on query analysis\n");
+    content.push_str("-- Generated at: ");
+    // Note: We can't use chrono here to avoid extra dependencies
+    content.push_str("[compile time]\n");
+    content.push_str("\n");
+    content.push_str("-- Usage: Run this file in your database to create recommended indexes\n");
+    content.push_str("-- Example: psql -U username -d database -f indexes_postgres.sql\n");
+    content.push_str("\n");
+    content.push_str("BEGIN;\n\n");
+
+    for index in indexes {
+        content.push_str("-- Index: ");
+        content.push_str(&index.name);
+        content.push_str("\n");
+        content.push_str("-- Table: ");
+        content.push_str(&index.table_name);
+        content.push_str("\n");
+        content.push_str("-- Reason: ");
+        content.push_str(&index.reason);
+        content.push_str("\n");
+        content.push_str(&index.to_create_sql(dialect));
+        content.push_str(";\n\n");
+    }
+
+    content.push_str("COMMIT;\n");
+
+    content
+}
+
+/// 生成 DROP INDEX SQL 文件内容（用于回滚）
+fn generate_drop_indexes_sql(indexes: &[IndexInfo], dialect: SqlDialect) -> String {
+    let mut content = String::new();
+
+    content.push_str("-- Auto-generated rollback script for sqlx_struct_enhanced\n");
+    content.push_str(&format!("-- Database: {:?}\n", dialect));
+    content.push_str("-- This file will DROP all indexes created by the migration\n");
+    content.push_str("-- ⚠️  WARNING: Use with caution!\n");
+    content.push_str("\n");
+    content.push_str("-- Usage: Run this file to rollback the indexes\n");
+    content.push_str("-- Example: psql -U username -d database -f drop_indexes_postgres.sql\n");
+    content.push_str("\n");
+    content.push_str("BEGIN;\n\n");
+
+    // 反向顺序删除（先删除最后创建的索引）
+    for index in indexes.iter().rev() {
+        content.push_str("-- Drop index: ");
+        content.push_str(&index.name);
+        content.push_str("\n");
+        content.push_str(&index.to_drop_sql(dialect));
+        content.push_str(";\n\n");
+    }
+
+    content.push_str("COMMIT;\n");
+
+    content
 }
 
 /// 解释推荐原因
@@ -407,19 +830,18 @@ fn extract_columns_from_condition(condition: &str) -> Vec<String> {
 }
 
 /// 检查列是否属于当前表
-/// 通过检查 FROM 子句中的表别名
+/// 使用别名解析来检查列是否属于当前表
 fn is_current_table_column(table_alias: &str, sql: &str) -> bool {
+    let aliases = extract_table_aliases(sql);
+    let resolved_table = aliases.resolve(table_alias);
+
+    // 检查解析后的表名是否是主表（检查 FROM 子句）
     let sql_lower = sql.to_lowercase();
 
-    // 查找 FROM 子句
     if let Some(from_pos) = sql_lower.find("from") {
         let after_from = &sql[from_pos + 4..];
-
-        // 提取 FROM 到第一个 JOIN 或 WHERE 之间的内容
         let from_clause = extract_until_keywords(after_from, &["join", "where", "group", "order", "limit"]);
-
-        // 检查表别名是否在 FROM 子句中
-        from_clause.contains(table_alias)
+        from_clause.contains(&resolved_table)
     } else {
         false
     }
